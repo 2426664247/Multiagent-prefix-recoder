@@ -76,9 +76,31 @@ Local Prompt Compiler
   -> Cache-Utility Validator
 ```
 
+当前讨论后的三模块定义必须明确：
+
+- `Compiler`：把 prompt 拆成带语义和风险属性的 IR 块。
+- `Planner`：把可共享、可前置的 IR 块组织成 prefix tree。
+- `Validator`：检查这棵树是否安全、是否有收益、是否应该回退。
+
+这里的 IR block 不是“已经决定要复用的块”，而是“可供复用判断和重排规划的候选语义块”。每个 IR block 都要携带语义类型、来源、共享范围、可移动性、风险标签和内容指纹。Planner 再从这些候选块中挑选真正适合进入 prefix tree 的内容。
+
+目标 prefix tree 的直觉结构是：
+
+```text
+root: 所有 agent 共享的全局 prompt
+  -> subgroup node: 某些 agent 子组共享的 prompt
+    -> leaf: 单个 agent 的特殊内容
+```
+
+越靠近 root 的 block，被更多 agent 和更多请求复用；越靠近 leaf 的 block，越偏向 agent-specific。每次发请求时，都按 root -> subgroup -> leaf 的顺序组织 prompt，从而让不同 agent 的请求在开头形成尽可能长的一致前缀。
+
+这里追求的不是无约束的最大 cache hit，而是在语义安全、可移动性、工具权限和消息顺序约束下的最大可用 prefix cache 收益。
+
 ### 3.1 Local Prompt Compiler
 
-`Local Prompt Compiler` 负责把 AutoGen 原始模型输入转成 block-level semantic IR。它回答的问题是：当前请求里有哪些上下文块，每个块是什么语义，是否可能共享，是否可能前置，有什么风险。
+`Local Prompt Compiler` 负责把 AutoGen 原始模型输入拆成 block-level semantic IR。它回答的问题是：当前请求里有哪些上下文块，每个块是什么语义，来自哪里，是否可能共享，是否可能前置，有什么风险。
+
+Compiler 不决定最终 prefix tree，也不直接移动内容。它只产出结构化 IR，让后续 Planner 能判断哪些块有复用价值、哪些块必须保守处理。
 
 **输入**
 
@@ -140,17 +162,9 @@ Local Prompt Compiler
 - 对 private memory、role identity、private tool permission、latest/current instruction 要默认保守。
 - Compiler 不直接重排 prompt，只生成 IR。
 
-**需要特别想清楚的问题**
-
-- 多个 agent 的请求如何归入同一个 logical session。
-- 如果不同 agent 使用不同 `PrefixReorderClient` 实例，是否需要共享一个轻量 session state。
-- tool schema 是作为 tools 参数保留，还是只作为 IR 中的不可改写结构参与判断。
-- 当前用户任务和历史用户任务如何区分。
-- group chat 历史是否只做识别，不在第一版移动。
-
 ### 3.2 Hierarchical Prefix Planner
 
-`Hierarchical Prefix Planner` 负责根据 semantic IR 生成重排计划。它回答的问题是：哪些 block 可以向前移动，移动到哪里，为什么移动，哪些 block 必须保持原位。
+`Hierarchical Prefix Planner` 负责把可共享、可前置的 IR block 组织成 prefix tree。它回答的问题是：哪些 block 可以进入 root 全局前缀，哪些 block 只适合进入子组前缀，哪些 block 必须留在 agent-specific suffix。
 
 Planner 的概念结构仍然是：
 
@@ -160,11 +174,7 @@ global shared prefix
   -> agent-specific suffix
 ```
 
-第一版不要求做复杂树优化，但要保留这个设计方向。可以先实现保守版本：
-
-- 只移动明确全局共享、稳定、低风险的 block。
-- 子组共享 prefix 暂时只在 plan 中保留概念，不必做复杂聚类。
-- agent 私有、顺序敏感、高风险内容必须保留在原位置或 agent-specific 区域。
+这棵树表达的是共享范围：root 一定是所有相关 agent 都相同的全局 prompt；root 之后可以接若干子组共享 prompt；最后叶子节点保留每个 agent 的特殊内容。越靠近树根，block 被使用的次数越多，也越可能形成跨 agent 的 prefix cache 命中。
 
 **输入**
 
@@ -203,6 +213,7 @@ Planner 不直接改 messages，而是输出 plan。plan 至少包含：
 - 移动后会跨越最新用户指令，不移动。
 - 移动后会改变 tool call / tool result 对应关系，不移动。
 - 只对 block 做顺序规划，不改写 block 内容。
+- 生成后的 prompt 顺序应体现 root -> subgroup -> leaf 的路径展开。
 
 **需要特别想清楚的问题**
 
@@ -214,7 +225,7 @@ Planner 不直接改 messages，而是输出 plan。plan 至少包含：
 
 ### 3.3 Cache-Utility Validator
 
-`Cache-Utility Validator` 负责决定 Planner 的结果是否可以采用。它回答的问题是：这次重排是否仍然保持内容一致、边界安全，并且具备缓存收益的可能。
+`Cache-Utility Validator` 负责检查 Planner 构建出的 prefix tree 是否可以采用。它不是简单的日志模块，而是安全阀和反馈器。它回答的问题是：这棵树是否安全，是否可能带来缓存收益，是否应该回退或要求 Planner 重建。
 
 第一版 Validator 重点做静态验证和回退机制。任务效用评估可以先留接口。
 
