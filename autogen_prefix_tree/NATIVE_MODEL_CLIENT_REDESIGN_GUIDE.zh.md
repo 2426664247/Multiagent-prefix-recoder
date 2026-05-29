@@ -60,7 +60,7 @@ AutoGen Agent / Team
 
 ## 3. 当前阶段只做最小接入
 
-第一版只考虑一种接入方式：
+第一版只考虑最简单、最直接的接入方式：写一个插件类，暴露一个接口，把它接到原本工程项目的 `model_client` 前面。
 
 ```text
 inner_client = OpenAIChatCompletionClient(...)
@@ -68,14 +68,40 @@ model_client = PrefixReorderClient(inner_client)
 agent = AssistantAgent(..., model_client=model_client)
 ```
 
-不要在第一版设计复杂的接入体系。暂时不做：
+这里的 `PrefixReorderClient` 不是新的模型客户端实现，也不是新的 HTTP 服务。它只是一个前置包装层，负责在每次模型调用前做这条链路：
+
+```text
+接收原始 model_client 调用参数
+  -> 获取原始 prompt / LLMMessage / tools / model args
+  -> 交给 Local Prompt Compiler 构造 IR
+  -> 交给 Hierarchical Prefix Planner 生成重排计划
+  -> 交给 Cache-Utility Validator 做安全与一致性验证
+  -> 如果验证通过，把重排后的 messages 交还给 inner_client
+  -> 如果验证失败，把原始 messages 原样交还给 inner_client
+```
+
+也就是说，原工程里原本是：
+
+```text
+Agent -> OpenAIChatCompletionClient -> HTTP API
+```
+
+改造后变成：
+
+```text
+Agent -> PrefixReorderClient -> OpenAIChatCompletionClient -> HTTP API
+```
+
+`OpenAIChatCompletionClient` 仍然负责把 messages 转成 HTTP 请求并发送给云端 API。`PrefixReorderClient` 只负责在它前面拿到原始 prompt、按三模块算法调整顺序、再把结果还给它。
+
+第一版不要设计复杂的接入体系。暂时不做：
 
 - 配置式 provider。
 - 工厂函数封装。
 - 多框架统一抽象层。
 - 独立 HTTP proxy 服务。
 
-这些可以作为后续扩展。第一版只要把 `PrefixReorderClient(inner_client)` 这条路线设计清楚。
+这些可以作为后续扩展。第一版只要把 `PrefixReorderClient(inner_client)` 这条路线设计清楚，并确保它能稳定接到现有 AutoGen 项目的 `model_client` 前面。
 
 ## 4. 三模块主线
 
