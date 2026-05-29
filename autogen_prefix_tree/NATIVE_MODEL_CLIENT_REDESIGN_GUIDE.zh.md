@@ -1,20 +1,36 @@
-# Multiagent Prefix Reorder 工具重设计指导
+# Prefix 重排工具改造指导
 
-本文档给下一个 agent 使用。它的作用不是写实现细节，而是说明这个工具下一步要被设计成什么、为什么要这样设计、哪些旧方案不再作为主线，以及实现时必须遵守哪些边界。
+本文档是给下一个 agent 的改造说明。它的任务不是从零发明一个新项目，而是在理解当前 `autogen_prefix_tree` 工具的基础上，重新设计下一版实现路线：从旧的 HTTP 代理模式，改造成插在 AutoGen `model_client` 前面的 prompt 重排中间件。
 
-新仓库已经建立：
+请下一个 agent 先读本文档，再去读旧代码。旧代码可以作为经验来源，但不要沿着旧 HTTP proxy 继续做主实现。
+
+## 1. 当前工具是什么
+
+当前 `autogen_prefix_tree` 的核心实现是一个 OpenAI-compatible HTTP 代理：
 
 ```text
-git@github.com:2426664247/Multiagent-prefix-recoder.git
+AutoGen Agent / Team
+  -> autogen_prefix_tree.proxy
+  -> OpenAI-compatible API
 ```
 
-请把后续重设计工作放到这个仓库思路下推进。当前目录里的旧 `autogen_prefix_tree` 可以作为历史参考；未来总目标不是只服务 AutoGen，而是逐步适配大部分 multi-agent 框架。AutoGen 只是第一个试点框架。
+它的优点是接入轻，AutoGen 只要把 `base_url` 指向本地代理，就能经过插件。代理会截取 HTTP JSON 请求，分析 `messages/tools/model`，尝试重排可共享内容，再把请求转发给云端 API。
 
-## 1. 总目标
+但这个模式有一个根本限制：HTTP 代理看到的是 AutoGen 已经压平后的 OpenAI-compatible JSON，它能无损转发请求本身，却不能无损还原 AutoGen 内部语义。
 
-目标是构建一个 multi-agent prompt prefix reorder 工具。它在多 agent 框架调用大模型之前，捕获原始模型输入，识别其中可共享、可安全前置的 prompt block，重新安排 block 顺序，从而提升 prefix cache / KV cache 命中率。
+具体来说，HTTP JSON 很难可靠判断：
 
-当前阶段只做 AutoGen 试点，最小目标是：
+- system prompt 中哪部分是 agent role，哪部分是 team policy。
+- 哪些内容来自 memory 注入，哪些是用户任务。
+- 哪些消息在 AutoGen 内部是 `SystemMessage`、`UserMessage`、`AssistantMessage` 或 tool result。
+- 哪些 tool 是公共工具，哪些是 agent 私有工具。
+- 哪些历史来自 group chat，哪些是当前轮指令。
+
+因此，旧 HTTP 代理适合做早期验证，但不适合作为下一版主路线。
+
+## 2. 要改造成什么
+
+下一版要改成 AutoGen 原生模型调用层中间件。新的调用链应是：
 
 ```text
 AutoGen Agent / Team
@@ -23,31 +39,28 @@ AutoGen Agent / Team
   -> 云端 API
 ```
 
-也就是说，新工具只插在原始 `model_client` 前面。它获取 AutoGen 即将交给 `OpenAIChatCompletionClient` 的原始 prompt/message，完成三模块处理后，把重排后的结果交还给原始 `OpenAIChatCompletionClient`，由后者继续转成 HTTP 请求并发给云端 API。
+也就是说，插件只出现在一个地方：原始 `OpenAIChatCompletionClient` 前面。
 
-第一版不做复杂接入方式，不做多框架抽象层，不做配置 provider，不做 HTTP 代理服务。只实现一个清晰的 wrapper 接口。
+它要做的事情只有三件：
 
-## 2. 为什么不继续用 HTTP 代理作为主线
+1. 捕获 AutoGen 即将交给模型客户端的原始 `LLMMessage`、tools 和 model args。
+2. 根据三模块算法生成重排后的 messages。
+3. 把重排结果交回原始 `OpenAIChatCompletionClient`，由它继续转成 HTTP 请求并调用云端 API。
 
-旧版本是 OpenAI-compatible HTTP 代理：
+它不应该：
 
-```text
-AutoGen -> HTTP proxy -> OpenAI-compatible API
-```
+- 修改 AutoGen 源码。
+- monkey patch AutoGen 内部函数。
+- 自己发 HTTP 请求。
+- 替代 `OpenAIChatCompletionClient` 的模型适配能力。
+- 参与 agent 创建、team 调度、tool 执行或 memory 存储。
+- 修改模型响应。
 
-这个方案可以无损看到 HTTP JSON 请求本身，例如 `messages`、`tools`、`model` 等字段，也可以无损转发给云端 API。但它不能无损还原 AutoGen 内部语义。例如：
+这个工具本质上是“模型客户端前置中间件”，不是独立网络代理。
 
-- system prompt 中哪部分来自 agent role，哪部分来自 team policy。
-- 哪些内容是 memory 注入，哪些是用户任务。
-- 哪些消息是 AutoGen 内部的 `SystemMessage`、`UserMessage`、`AssistantMessage` 或 tool result。
-- 哪些 tool 是公共 tool，哪些是 agent 私有 tool。
-- 哪些历史来自 group chat，哪些是当前轮指令。
+## 3. 当前阶段只做最小接入
 
-因此，HTTP 代理模式可以保留为历史参考或 fallback，但不应作为新版工具的主设计。新版主设计应在 AutoGen 内部 `model_client` 边界捕获结构化输入，而不是在 HTTP JSON 层反推语义。
-
-## 3. 当前阶段的唯一接入方式
-
-第一版只考虑一种最简单的接入方式：
+第一版只考虑一种接入方式：
 
 ```text
 inner_client = OpenAIChatCompletionClient(...)
@@ -55,22 +68,18 @@ model_client = PrefixReorderClient(inner_client)
 agent = AssistantAgent(..., model_client=model_client)
 ```
 
-对工程项目来说，只需要把原来传给 agent 的 `OpenAIChatCompletionClient` 换成 `PrefixReorderClient(OpenAIChatCompletionClient)`。
+不要在第一版设计复杂的接入体系。暂时不做：
 
-注意：
+- 配置式 provider。
+- 工厂函数封装。
+- 多框架统一抽象层。
+- 独立 HTTP proxy 服务。
 
-- 不修改 AutoGen 源码。
-- 不 monkey patch AutoGen 内部函数。
-- 不自己实现 HTTP 请求。
-- 不替代 `OpenAIChatCompletionClient` 的模型适配能力。
-- 不参与 agent 创建、team 调度、tool 执行或 memory 存储。
-- 只在模型调用前重排 prompt/message。
-
-这个工具本质上是“模型客户端前置中间件”，不是独立网络代理。
+这些可以作为后续扩展。第一版只要把 `PrefixReorderClient(inner_client)` 这条路线设计清楚。
 
 ## 4. 三模块主线
 
-新版仍然沿用 `AgentTeam共享Prefix.pdf` 中的三模块设计：
+下一版仍然沿用 `AgentTeam共享Prefix.pdf` 里的三模块设计：
 
 ```text
 Local Prompt Compiler
@@ -82,7 +91,7 @@ Local Prompt Compiler
 
 职责：把 AutoGen 原始模型输入转换成 block-level semantic IR。
 
-输入来自 `PrefixReorderClient` 捕获到的 AutoGen 模型调用参数，至少包括：
+输入来自 `PrefixReorderClient` 捕获到的模型调用参数，至少包括：
 
 - `LLMMessage` 序列。
 - tools 参数。
@@ -155,7 +164,7 @@ global shared prefix
 但第一版不需要实现复杂树优化。先做保守规则即可：
 
 - 全局共享、稳定、低风险的 block 可以前置。
-- 子组共享内容可以作为后续扩展，第一版可只保留设计口径。
+- 子组共享内容可以作为后续扩展，第一版只保留设计口径。
 - agent 私有、顺序敏感、高风险内容必须留在原位置或 agent-specific 区域。
 
 Planner 应输出 plan，而不是直接改消息。plan 至少包含：
@@ -227,7 +236,7 @@ Strict reorder 必须满足：
 
 特别注意：旧 HTTP 代理中的 `PREFIX_TREE_LAYOUT_START`、`GLOBAL_PREFIX_START` 等包装标签，不应出现在 strict mode 里，因为它们会改变模型看到的内容。
 
-## 6. 旧代码如何处理
+## 6. 旧代码怎么参考
 
 当前目录里的旧实现可以作为参考材料：
 
@@ -266,7 +275,7 @@ autogen_prefix_tree/
   native_trace.py
 ```
 
-但概念上新项目应面向 `Multiagent-prefix-recoder`，AutoGen 只是第一阶段适配对象。
+概念上，新项目最终应面向多 multi-agent 框架；AutoGen 只是第一阶段适配对象。
 
 ## 8. Trace 要求
 
@@ -311,6 +320,16 @@ autogen_prefix_tree/
 - strict mode 不新增包装文本。
 - 旧 HTTP proxy 不再作为主实现路线。
 
-## 10. 一句话总结
+## 10. 交付位置
 
-新版工具应是一个面向多 multi-agent 框架的 prefix reorder 中间件。当前阶段只做 AutoGen 试点，并且只实现最小接入方式：`PrefixReorderClient` 包在原始 `OpenAIChatCompletionClient` 前面。它通过 Local Prompt Compiler、Hierarchical Prefix Planner、Cache-Utility Validator 三模块，在模型调用前完成严格、保守、可验证的 prompt block 顺序调整，然后把结果交还给原始 model client 继续请求云端 API。
+用户已经建立新仓库：
+
+```text
+git@github.com:2426664247/Multiagent-prefix-recoder.git
+```
+
+后续正式改造工作应放到这个仓库中。当前仓库/目录中的旧 `autogen_prefix_tree` 只作为历史参考和可借鉴代码来源。
+
+## 11. 一句话总结
+
+下一个 agent 要做的是：把现有 prefix 重排工具从“HTTP 层代理”改造成“AutoGen model client 前置中间件”。第一版只实现 `PrefixReorderClient(inner_client)` 这一条接入路线，通过 Local Prompt Compiler、Hierarchical Prefix Planner、Cache-Utility Validator 三模块，在模型调用前完成严格、保守、可验证的 prompt block 顺序调整，然后把结果交还给原始 `OpenAIChatCompletionClient` 继续请求云端 API。
