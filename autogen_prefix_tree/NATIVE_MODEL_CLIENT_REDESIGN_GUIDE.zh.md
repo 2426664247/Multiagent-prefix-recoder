@@ -1,8 +1,8 @@
 # Prefix 重排工具改造指导
 
-本文档是给下一个 agent 的改造说明。它的任务不是从零发明一个新项目，而是在理解当前 `autogen_prefix_tree` 工具的基础上，重新设计下一版实现路线：从旧的 HTTP 代理模式，改造成插在 AutoGen `model_client` 前面的 prompt 重排中间件。
+本文档是给下一个 agent 的改造说明。它的任务是基于当前讨论结果，重新设计下一版 prefix 重排工具：从旧的 HTTP 代理模式，改造成插在 AutoGen `model_client` 前面的 prompt 重排中间件。
 
-请下一个 agent 先读本文档，再去读旧代码。旧代码可以作为经验来源，但不要沿着旧 HTTP proxy 继续做主实现。
+下一个 agent 不需要继续阅读或迁移旧实现。旧代码只作为历史记录存在，正式实现可以从干净工作区重新开始。
 
 ## 1. 当前工具是什么
 
@@ -262,18 +262,32 @@ Strict reorder 必须满足：
 
 特别注意：旧 HTTP 代理中的 `PREFIX_TREE_LAYOUT_START`、`GLOBAL_PREFIX_START` 等包装标签，不应出现在 strict mode 里，因为它们会改变模型看到的内容。
 
-## 6. 旧代码怎么参考
+## 6. 工作区与旧代码处理
 
-当前目录里的旧实现可以作为参考材料：
+下一步可以直接清空当前实现工作区，从一个干净的 Python 项目结构开始。不要为了兼容旧 HTTP 代理而保留旧目录结构，也不要把旧代码搬进新实现里。
 
-- `compiler.py`：参考 block IR 和 marker 分类经验。
-- `planner.py`：参考 prefix tree/global-subgroup-suffix 思路。
-- `cache_oracle.py`：参考本地 cache hit 估计方式。
-- `proxy.py`：仅作为旧 HTTP 代理参考，不作为新版主入口。
+旧实现的历史价值通过 git 记录保留即可。后续 agent 如果确实需要回看旧思路，可以通过版本历史或旧仓库记录查看，而不是在新实现里继续引用旧模块。
 
-但是，下一个 agent 不应继续沿着 HTTP proxy 做主实现。
+新的实现应以 `PrefixReorderClient(inner_client)` 为中心，从零组织文件、类型和测试。
 
 另外，`cache_hit_proxy` 是另一个独立仓库，不属于本项目。后续如果需要复用它，应作为外部依赖或独立引用处理，不要把它当作新仓库的一部分直接混入。
+
+代码注释要求：
+
+- 关键设计注释、复杂逻辑注释、TODO 注释尽量使用中文，方便用户直接审阅。
+- 不需要给显而易见的代码写空泛注释。
+- 重要边界条件要用中文说明为什么不能移动某些 block。
+
+版本控制要求：
+
+- 每完成一个清晰阶段就提交一次 git commit。
+- commit message 可以用英文或中文，但要清楚表达改动目的。
+- 重要阶段要打 tag，建议类似：
+  - `guide-v1`
+  - `autogen-wrapper-plan-v1`
+  - `autogen-wrapper-mvp`
+  - `strict-reorder-mvp`
+- 不要把实验输出、密钥、虚拟环境、外部仓库混进提交。
 
 ## 7. 推荐最小文件结构
 
@@ -289,19 +303,7 @@ multiagent_prefix_recoder/
   trace.py               # hash 与 trace 记录
 ```
 
-如果暂时仍在旧 `autogen_prefix_tree` 目录下推进，也可以先用类似命名：
-
-```text
-autogen_prefix_tree/
-  native_client.py
-  native_compiler.py
-  native_planner.py
-  native_validator.py
-  native_types.py
-  native_trace.py
-```
-
-概念上，新项目最终应面向多 multi-agent 框架；AutoGen 只是第一阶段适配对象。
+不建议继续在旧 `autogen_prefix_tree` 目录结构里推进正式实现。新项目最终应面向多 multi-agent 框架；AutoGen 只是第一阶段适配对象。
 
 ## 8. Trace 要求
 
@@ -345,6 +347,9 @@ autogen_prefix_tree/
 - trace 默认不保存 raw prompt。
 - strict mode 不新增包装文本。
 - 旧 HTTP proxy 不再作为主实现路线。
+- 关键注释使用中文，特别是安全边界、回退原因和 block 不可移动规则。
+- 至少有清晰的 git commit 记录。
+- 第一版 MVP 完成后打一个明确 tag。
 
 ## 10. 交付位置
 
@@ -354,7 +359,7 @@ autogen_prefix_tree/
 git@github.com:2426664247/Multiagent-prefix-recoder.git
 ```
 
-后续正式改造工作应放到这个仓库中。当前仓库/目录中的旧 `autogen_prefix_tree` 只作为历史参考和可借鉴代码来源。
+后续正式改造工作应放到这个仓库中。可以从干净工作区开始，不需要保留当前目录中的旧 `autogen_prefix_tree` 实现。
 
 ## 11. 一句话总结
 
