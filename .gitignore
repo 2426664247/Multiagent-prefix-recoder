@@ -1,0 +1,25 @@
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local environments and secrets.
+.venv/
+venv/
+env/
+config/
+
+# Large or generated experiment artifacts.
+cache_hit_proxy/
+tmp/
+autogen_prefix_tree_results/
+autogen_cache_probe/results/
+autogen_groupchat_kvcache_experiment/raw_prompts/
+autogen_groupchat_kvcache_experiment/tokenized_prompts/
+autogen_groupchat_kvcache_experiment/results/
+framework_cache_shapes_experiment/captures/
+framework_cache_shapes_experiment/tokenized_prompts/
+framework_cache_shapes_experiment/results/
+deepseek-cache-verifier/results/
+
+# Local trace output.
+cache_hit_proxy/traces/
