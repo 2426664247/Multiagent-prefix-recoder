@@ -33,6 +33,7 @@ from autogen_prefix_tree import (
     PrefixReorderClient,
     PrefixTree,
     PrefixTreeNode,
+    SemanticGuardReport,
     SemanticType,
     ShareScope,
     load_jsonl_telemetry,
@@ -141,6 +142,37 @@ class FakeClient(ChatCompletionClient):
 class FailingCompiler(LocalPromptCompiler):
     def compile(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         raise RuntimeError("compiler exploded")
+
+
+class PassingSemanticGuard:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluate(self, **_: Any) -> SemanticGuardReport:
+        self.calls += 1
+        return SemanticGuardReport(
+            passed=True,
+            reason="semantic_invariants_hold",
+            checks=("agent_identity", "latest_instruction"),
+            model_name="fake-local-judge",
+            confidence=0.91,
+        )
+
+
+class RejectingSemanticGuard:
+    def evaluate(self, **_: Any) -> SemanticGuardReport:
+        return SemanticGuardReport(
+            passed=False,
+            reason="agent_identity_uncertain",
+            checks=("agent_identity",),
+            model_name="fake-local-judge",
+            confidence=0.42,
+        )
+
+
+class ThrowingSemanticGuard:
+    def evaluate(self, **_: Any) -> SemanticGuardReport:
+        raise RuntimeError("judge failed")
 
 
 def _system_content(agent: str, shared: str = "Shared project context.") -> str:
@@ -298,6 +330,56 @@ def test_prefix_reorder_client_emits_prompt_safe_telemetry() -> None:
     serialized = json.dumps(records[1], ensure_ascii=False)
     assert "AGENT_NAME: engineer" not in serialized
     assert "Shared project context." not in serialized
+
+
+def test_semantic_guard_allows_validated_rewrite_and_emits_report() -> None:
+    inner = FakeClient()
+    guard = PassingSemanticGuard()
+    records: list[dict[str, Any]] = []
+    validator = CacheUtilityValidator(semantic_guard=guard)
+    client = PrefixReorderClient(inner, session_id="team", validator=validator, telemetry_sink=records.append)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    second_content = inner.create_calls[1]["messages"][0].content
+    assert second_content.index("USER_TASK_START") < second_content.index("ROLE_SPECIFIC_INSTRUCTION_START")
+    assert guard.calls == 1
+    assert client.last_validation_report is not None
+    assert client.last_validation_report.fallback is False
+    assert client.last_validation_report.semantic_guard_report is not None
+    assert client.last_validation_report.semantic_guard_report.passed is True
+    assert records[-1]["semantic_guard"]["checks"] == ("agent_identity", "latest_instruction")
+
+
+def test_semantic_guard_rejection_forces_fallback() -> None:
+    inner = FakeClient()
+    validator = CacheUtilityValidator(semantic_guard=RejectingSemanticGuard())
+    client = PrefixReorderClient(inner, session_id="team", validator=validator)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    second_content = inner.create_calls[1]["messages"][0].content
+    assert second_content.index("ROLE_SPECIFIC_INSTRUCTION_START") < second_content.index("USER_TASK_START")
+    assert client.last_validation_report is not None
+    assert client.last_validation_report.fallback is True
+    assert client.last_validation_report.reason == "semantic_guard_failed:agent_identity_uncertain"
+    assert client.last_telemetry_record is not None
+    assert client.last_telemetry_record["semantic_guard"]["passed"] is False
+
+
+def test_semantic_guard_exception_fails_closed() -> None:
+    inner = FakeClient()
+    validator = CacheUtilityValidator(semantic_guard=ThrowingSemanticGuard())
+    client = PrefixReorderClient(inner, session_id="team", validator=validator)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    assert client.last_validation_report is not None
+    assert client.last_validation_report.fallback is True
+    assert client.last_validation_report.reason == "semantic_guard_failed:exception:RuntimeError"
 
 
 def test_prefix_reorder_client_writes_jsonl_telemetry(tmp_path) -> None:

@@ -8,6 +8,7 @@ from autogen_core.models import LLMMessage
 
 from .ir import CompileResult, Movability, PrefixTreeNode, hash_model_args, hash_tools, stable_hash
 from .planner import PrefixPlan
+from .semantic_guard import SemanticGuard, SemanticGuardReport
 
 
 @dataclass(frozen=True)
@@ -27,14 +28,16 @@ class ValidationReport:
     fallback: bool
     reason: str
     utility_estimate: CacheUtilityEstimate | None = None
+    semantic_guard_report: SemanticGuardReport | None = None
     risk_notes: tuple[str, ...] = ()
 
 
 class CacheUtilityValidator:
     """独立安全阀：无法证明只发生允许的 block 顺序变化时，一律回退。"""
 
-    def __init__(self, *, min_estimated_gain_chars: int = 1) -> None:
+    def __init__(self, *, min_estimated_gain_chars: int = 1, semantic_guard: SemanticGuard | None = None) -> None:
         self.min_estimated_gain_chars = min_estimated_gain_chars
+        self.semantic_guard = semantic_guard
 
     def validate(
         self,
@@ -56,20 +59,28 @@ class CacheUtilityValidator:
                 True,
                 plan.fallback_reason or "planner_required_fallback",
                 utility_estimate,
+                None,
                 plan.risk_notes,
             )
 
         original_ids = tuple(block.block_id for block in compile_result.blocks)
         if Counter(original_ids) != Counter(plan.new_order):
-            return ValidationReport(False, True, "block_id_multiset_changed", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "block_id_multiset_changed", utility_estimate, None, plan.risk_notes)
 
         if plan.prefix_tree is None:
-            return ValidationReport(False, True, "prefix_tree_missing", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "prefix_tree_missing", utility_estimate, None, plan.risk_notes)
         tree_ids = tuple(self._iter_tree_block_ids(plan.prefix_tree.root))
         if Counter(tree_ids) != Counter(original_ids):
-            return ValidationReport(False, True, "prefix_tree_block_coverage_mismatch", utility_estimate, plan.risk_notes)
+            return ValidationReport(
+                False,
+                True,
+                "prefix_tree_block_coverage_mismatch",
+                utility_estimate,
+                None,
+                plan.risk_notes,
+            )
         if not self._cacheable_prefix_is_front_loaded(plan):
-            return ValidationReport(False, True, "cacheable_prefix_not_at_front", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "cacheable_prefix_not_at_front", utility_estimate, None, plan.risk_notes)
 
         original_hashes = Counter(block.content_hash for block in compile_result.blocks)
         planned_hashes = Counter(
@@ -78,13 +89,13 @@ class CacheUtilityValidator:
             if block.block_id in set(plan.new_order)
         )
         if original_hashes != planned_hashes:
-            return ValidationReport(False, True, "block_hash_multiset_changed", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "block_hash_multiset_changed", utility_estimate, None, plan.risk_notes)
 
         if compile_result.tools_hash != hash_tools(tools):
-            return ValidationReport(False, True, "tools_hash_changed", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "tools_hash_changed", utility_estimate, None, plan.risk_notes)
 
         if compile_result.model_args_hash != hash_model_args(tool_choice, json_output, extra_create_args):
-            return ValidationReport(False, True, "model_args_hash_changed", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "model_args_hash_changed", utility_estimate, None, plan.risk_notes)
 
         forbidden_original_order: list[str] = []
         forbidden_new_order = [
@@ -105,6 +116,7 @@ class CacheUtilityValidator:
                         True,
                         f"forbidden_block_moved:{block.block_id}",
                         utility_estimate,
+                        None,
                         plan.risk_notes,
                     )
         if tuple(forbidden_original_order) != tuple(forbidden_new_order):
@@ -113,23 +125,25 @@ class CacheUtilityValidator:
                 True,
                 "forbidden_block_relative_order_changed",
                 utility_estimate,
+                None,
                 plan.risk_notes,
             )
 
         if len(original_messages) != len(rewritten_messages):
-            return ValidationReport(False, True, "message_count_changed", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "message_count_changed", utility_estimate, None, plan.risk_notes)
 
         for original, rewritten in zip(original_messages, rewritten_messages):
             if getattr(original, "type", type(original).__name__) != getattr(rewritten, "type", type(rewritten).__name__):
-                return ValidationReport(False, True, "message_type_changed", utility_estimate, plan.risk_notes)
+                return ValidationReport(False, True, "message_type_changed", utility_estimate, None, plan.risk_notes)
             if getattr(original, "source", None) != getattr(rewritten, "source", None):
-                return ValidationReport(False, True, "message_source_changed", utility_estimate, plan.risk_notes)
+                return ValidationReport(False, True, "message_source_changed", utility_estimate, None, plan.risk_notes)
             if not hasattr(rewritten, "model_dump"):
                 return ValidationReport(
                     False,
                     True,
                     "rewritten_message_not_serializable",
                     utility_estimate,
+                    None,
                     plan.risk_notes,
                 )
 
@@ -138,18 +152,59 @@ class CacheUtilityValidator:
             compile_result=compile_result,
             plan=plan,
         ):
-            return ValidationReport(False, True, "rewritten_content_mismatch", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "rewritten_content_mismatch", utility_estimate, None, plan.risk_notes)
 
         if plan.moved_blocks and utility_estimate.estimated_gain_chars < self.min_estimated_gain_chars:
-            return ValidationReport(False, True, "insufficient_cache_utility", utility_estimate, plan.risk_notes)
+            return ValidationReport(False, True, "insufficient_cache_utility", utility_estimate, None, plan.risk_notes)
+
+        semantic_guard_report = self._run_semantic_guard(
+            original_messages=original_messages,
+            rewritten_messages=rewritten_messages,
+            compile_result=compile_result,
+            plan=plan,
+        )
+        if semantic_guard_report is not None and not semantic_guard_report.passed:
+            return ValidationReport(
+                False,
+                True,
+                f"semantic_guard_failed:{semantic_guard_report.reason}",
+                utility_estimate,
+                semantic_guard_report,
+                plan.risk_notes,
+            )
 
         return ValidationReport(
             applied=bool(plan.moved_blocks),
             fallback=False,
             reason="validated" if plan.moved_blocks else "no_rewrite_needed",
             utility_estimate=utility_estimate,
+            semantic_guard_report=semantic_guard_report,
             risk_notes=plan.risk_notes,
         )
+
+    def _run_semantic_guard(
+        self,
+        *,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+    ) -> SemanticGuardReport | None:
+        if self.semantic_guard is None or not plan.moved_blocks:
+            return None
+        try:
+            return self.semantic_guard.evaluate(
+                original_messages=original_messages,
+                rewritten_messages=rewritten_messages,
+                compile_result=compile_result,
+                plan=plan,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SemanticGuardReport(
+                passed=False,
+                reason=f"exception:{type(exc).__name__}",
+                checks=("semantic_guard_exception",),
+            )
 
     def _iter_tree_block_ids(self, node: PrefixTreeNode) -> tuple[str, ...]:
         ids: list[str] = list(node.block_ids)

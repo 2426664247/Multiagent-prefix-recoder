@@ -101,6 +101,18 @@ F:/CodexProject/MutilAgent
 14 passed
 ```
 
+继续补充 semantic guard 接口后再次运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+17 passed
+```
+
 ## 4. 参考的 AutoGen 官方评测思路
 
 我查阅了 AutoGen 官方资料，主要参考：
@@ -204,7 +216,7 @@ Validator 现在额外检查：
 
 注意：这还不是 provider 返回的真实 cached tokens。后续接真实 API 时，需要把它和 API usage 里的 cached tokens、latency、cost 对齐。
 
-### 5.4 测试：从 9 个增加到 13 个
+### 5.4 测试：从 9 个增加到 17 个
 
 文件：`tests/test_native_prefix_reorder.py`
 
@@ -220,11 +232,14 @@ Validator 现在额外检查：
 - JSONL logger 能写入请求记录。
 - pipeline exception fallback 也会写 telemetry。
 - telemetry summary 能统计 apply/fallback/reuse 和 validation reason。
+- semantic guard 通过时允许重排并写 telemetry。
+- semantic guard 拒绝时强制 fallback。
+- semantic guard 抛异常时 fail closed。
 
 最终测试结果：
 
 ```text
-14 passed
+17 passed
 ```
 
 ### 5.5 测试配置
@@ -328,6 +343,42 @@ reviewer  -> validated
 - `applied_rate == 2/3`。
 
 这个 analyzer 可以直接用于后续 AutoGenBench A/B：插件侧先输出 JSONL，再用 summary 看规则覆盖率、fallback 原因和可复用前缀是否稳定形成。
+
+### 5.9 Semantic Guard：为本地小模型判断预留接口
+
+新增文件：`autogen_prefix_tree/semantic_guard.py`
+
+新增：
+
+- `SemanticGuardReport`
+- `SemanticGuard` protocol
+
+设计目的：
+
+老师建议后续可以加本地小模型辅助 semantic 规则判断。当前没有绑定某个具体模型，而是先把 Validator 的扩展点做出来。后续无论用本地小模型、规则 judge，还是一个混合 judge，都可以实现同一个 `evaluate(...)` 接口。
+
+接入方式：
+
+```python
+validator = CacheUtilityValidator(semantic_guard=local_judge)
+client = PrefixReorderClient(inner_client, validator=validator)
+```
+
+执行规则：
+
+- 只有静态不变量检查通过后才调用 semantic guard。
+- 只有发生 block 移动时才调用 guard，冷启动 no-rewrite 不调用。
+- guard 返回 `passed=False` 时，Validator 回退原始 messages。
+- guard 抛异常时也回退，原因形如 `semantic_guard_failed:exception:RuntimeError`。
+- telemetry 会记录 `semantic_guard` report，但不记录 prompt 正文。
+
+新增测试覆盖：
+
+- `PassingSemanticGuard`：确认本地 judge 通过时，重排仍然生效。
+- `RejectingSemanticGuard`：确认 judge 不确定时，原始 messages 被传给 inner client。
+- `ThrowingSemanticGuard`：确认 judge 抛异常时 fail closed。
+
+这一步没有真正调用本地小模型，但完成了 Validator 与本地语义判断模块的协作接口。后续接模型时，需要重点设计 judge prompt：例如询问当前 agent 身份、最新用户指令、private/shared 边界、tool result 对应关系是否仍然清楚。
 
 ## 6. 当前没有完成的真实 API / benchmark 工作
 
@@ -446,7 +497,8 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 3. `subgroup` 结构已经有数据模型，但当前 compiler 还没有可靠推断 subgroup scope。
 4. `rewrite_messages` 仍只支持移动同一个 system message 内的文本 block。
 5. Utility 估计和 summary 现在仍是字符级 / signature 级 proxy，不是真实 tokenizer / provider cached token。
-6. 没有 API key，所以没有真实 API cache / latency / cost 结果。
+6. Semantic guard 现在是接口和 fake judge 测试，还没有接真实本地小模型。
+7. 没有 API key，所以没有真实 API cache / latency / cost 结果。
 
 ## 9. 本轮产物清单
 
@@ -458,6 +510,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 - `autogen_prefix_tree/__init__.py`
 - `autogen_prefix_tree/client.py`
 - `autogen_prefix_tree/telemetry.py`
+- `autogen_prefix_tree/semantic_guard.py`
 
 测试：
 
@@ -473,5 +526,5 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-14 passed
+17 passed
 ```

@@ -247,6 +247,7 @@ class PrefixReorderClient(ChatCompletionClient):
                 "reason": report.reason,
             },
             "utility_estimate": dataclass_to_dict(report.utility_estimate),
+            "semantic_guard": dataclass_to_dict(report.semantic_guard_report),
             "risk_notes": report.risk_notes,
             "hashes": {
                 "tools": compile_result.tools_hash if compile_result else None,

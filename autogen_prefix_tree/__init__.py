@@ -11,6 +11,7 @@ from .ir import (
     ShareScope,
 )
 from .planner import HierarchicalPrefixPlanner, PrefixPlan, rewrite_messages
+from .semantic_guard import SemanticGuard, SemanticGuardReport
 from .telemetry import JsonlTelemetryLogger, TelemetrySink, TelemetrySummary, load_jsonl_telemetry, summarize_telemetry
 from .validator import CacheUtilityEstimate, CacheUtilityValidator, ValidationReport
 
@@ -29,6 +30,8 @@ __all__ = [
     "PrefixTreeNode",
     "PromptBlock",
     "SemanticType",
+    "SemanticGuard",
+    "SemanticGuardReport",
     "ShareScope",
     "TelemetrySink",
     "TelemetrySummary",

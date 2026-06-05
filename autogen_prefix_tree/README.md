@@ -42,6 +42,36 @@ Validator 现在会额外检查：
 
 `ValidationReport.utility_estimate` 会给出轻量指标，包括原始/重写后可复用前缀字符数、移动 block 字符数、估计增益和前后 block 指纹。后续接真实 API 时，可以把这些字段和 provider 返回的 cached tokens、latency、cost 一起记录。
 
+## Semantic Guard
+
+`CacheUtilityValidator` 支持可选 `semantic_guard`，用于后续接本地小模型或规则 judge。它不会替代静态安全检查，只会在静态检查通过后作为额外安全闸。
+
+```python
+from autogen_prefix_tree import CacheUtilityValidator, SemanticGuardReport
+
+
+class LocalJudge:
+    def evaluate(self, **kwargs):
+        return SemanticGuardReport(
+            passed=True,
+            reason="semantic_invariants_hold",
+            checks=("agent_identity", "latest_instruction"),
+            model_name="local-small-model",
+            confidence=0.9,
+        )
+
+
+validator = CacheUtilityValidator(semantic_guard=LocalJudge())
+model_client = PrefixReorderClient(inner_client, validator=validator)
+```
+
+规则：
+
+- 只有发生 block 移动时才调用 guard。
+- guard 返回 `passed=False` 时回退原始 messages。
+- guard 抛异常时也回退，reason 形如 `semantic_guard_failed:exception:RuntimeError`。
+- telemetry 会记录 guard report，但不记录 prompt 正文。
+
 ## Telemetry
 
 `PrefixReorderClient` 支持可选请求级 telemetry。默认不会写文件，只把最近一次记录保存在 `last_telemetry_record`，方便调试。
