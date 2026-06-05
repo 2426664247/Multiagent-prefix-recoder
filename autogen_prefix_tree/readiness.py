@@ -144,19 +144,74 @@ def _check_api_config(root: Path, env: Mapping[str, str], *, required: bool) -> 
 
 
 def _check_autogenbench(*, required: bool) -> ReadinessCheck:
-    cli = shutil.which("autogenbench")
+    cli = _resolve_autogenbench_cli()
     package = importlib.util.find_spec("autogenbench")
-    if cli or package is not None:
-        detail = "installed"
-        if cli:
-            detail += f": {cli}"
-        return ReadinessCheck("autogenbench", True, detail)
-    return ReadinessCheck(
-        "autogenbench",
-        not required,
-        "not installed",
-        r"Install in .venv with .venv\Scripts\python.exe -m pip install autogenbench.",
-    )
+    if cli is None:
+        if package is not None:
+            return ReadinessCheck(
+                "autogenbench",
+                not required,
+                "package installed but console script not found",
+                r'Reinstall in .venv with .venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35".',
+            )
+        return ReadinessCheck(
+            "autogenbench",
+            not required,
+            "not installed",
+            r'Install in .venv with .venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35".',
+        )
+    try:
+        completed = subprocess.run(
+            [str(cli), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ReadinessCheck(
+            "autogenbench",
+            not required,
+            f"cli smoke failed: {type(exc).__name__}",
+            "Verify the AutoGenBench console script inside .venv.",
+        )
+    if completed.returncode != 0:
+        first_line = _first_output_line(completed.stderr) or _first_output_line(completed.stdout)
+        detail = f"cli smoke failed with exit {completed.returncode}"
+        if first_line:
+            detail += f": {first_line}"
+        return ReadinessCheck(
+            "autogenbench",
+            not required,
+            detail,
+            "Verify AutoGenBench/pyautogen compatibility inside .venv; autogenbench 0.0.3 works with pyautogen==0.2.35.",
+        )
+    version = _first_output_line(completed.stdout)
+    detail = f"cli smoke ok: {cli}"
+    if version:
+        detail += f"; {version}"
+    return ReadinessCheck("autogenbench", True, detail)
+
+
+def _resolve_autogenbench_cli() -> Path | None:
+    cli = shutil.which("autogenbench")
+    if cli:
+        return Path(cli)
+    executable_dir = Path(sys.executable).parent
+    names = ("autogenbench.exe", "autogenbench-script.py") if os.name == "nt" else ("autogenbench",)
+    for name in names:
+        candidate = executable_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _first_output_line(value: str) -> str:
+    for line in value.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 def _check_autogen_core() -> ReadinessCheck:
@@ -173,10 +228,11 @@ def _check_autogen_core() -> ReadinessCheck:
 def _suggested_commands(root: Path) -> tuple[str, ...]:
     return (
         r".venv\Scripts\python.exe -m autogen_prefix_tree.microbench --telemetry tmp\prefix_microbench\requests.jsonl --summary tmp\prefix_microbench\summary.json --repeats 1",
-        r".venv\Scripts\python.exe -m pip install autogenbench",
-        "autogenbench clone HumanEval",
-        "autogenbench run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl",
-        "autogenbench tabulate Results/human_eval_two_agents",
+        r'.venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35"',
+        r".venv\Scripts\autogenbench.exe clone HumanEval",
+        "cd HumanEval",
+        r"..\.venv\Scripts\autogenbench.exe run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl",
+        r"..\.venv\Scripts\autogenbench.exe tabulate Results/human_eval_two_agents",
     )
 
 

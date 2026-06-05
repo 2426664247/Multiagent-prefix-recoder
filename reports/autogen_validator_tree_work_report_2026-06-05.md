@@ -151,7 +151,7 @@ F:/CodexProject/MutilAgent
 结果：
 
 ```text
-20 passed
+22 passed
 ```
 
 严格 readiness 检查：
@@ -166,12 +166,24 @@ F:/CodexProject/MutilAgent
 python_environment: ok
 docker: ok, Docker version 28.5.1
 api_config: missing
-autogenbench: not installed
+autogenbench: cli smoke ok
 autogen_core: ok
 ready: false
 ```
 
-这说明真实 API / AutoGenBench 评测当前还差两步：准备 `OPENAI_API_KEY` 或 `OAI_CONFIG_LIST`，以及在 `.venv` 中安装 `autogenbench`。
+随后在 `.venv` 中安装了 `autogenbench 0.0.3`。第一次安装会带入 `pyautogen 0.10.0`，但 `autogenbench --help` 报错：
+
+```text
+ModuleNotFoundError: No module named 'autogen'
+```
+
+原因是 AutoGenBench 0.0.3 仍依赖 AutoGen 0.2 时代的旧 `autogen` API，而 `pyautogen 0.10.0` 已迁移到新的 package 形态。之后在本仓库 `.venv` 中固定：
+
+```powershell
+.venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35"
+```
+
+此后 `autogenbench --help` 可以正常启动。现在真实 AutoGenBench/API 评测只剩一个硬阻塞：准备 `OPENAI_API_KEY` 或 `OAI_CONFIG_LIST`。
 
 ## 4. 参考的 AutoGen 官方评测思路
 
@@ -297,11 +309,12 @@ Validator 现在额外检查：
 - semantic guard 抛异常时 fail closed。
 - microbenchmark 能写出 telemetry JSONL 和 summary JSON。
 - readiness checker 能识别 API 配置缺失，且不输出 secret 值。
+- readiness checker 会实际执行 `autogenbench --help`，能发现 console script 存在但依赖不兼容的问题。
 
 最终测试结果：
 
 ```text
-20 passed
+22 passed
 ```
 
 ### 5.5 测试配置
@@ -513,10 +526,10 @@ validation_reason_counts = {"no_rewrite_needed": 1, "validated": 2}
 .venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
 ```
 
-如果只想检查除 API/autogenbench 外的其他条件：
+如果只想允许 API 配置缺失，但继续检查 AutoGenBench/Docker 等其他条件：
 
 ```powershell
-.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd . --allow-missing-api --allow-missing-autogenbench
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd . --allow-missing-api
 ```
 
 安全边界：
@@ -529,15 +542,16 @@ validation_reason_counts = {"no_rewrite_needed": 1, "validated": 2}
 
 ```text
 api_config = missing
-autogenbench = not installed
+autogenbench = cli smoke ok
 ```
 
 这一步让真实评测的阻塞条件变成可执行清单，而不是口头说明。下一步一旦提供 API 配置，可先执行：
 
 ```powershell
-.venv\Scripts\python.exe -m pip install autogenbench
-autogenbench clone HumanEval
-autogenbench run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl
+.venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35"
+.venv\Scripts\autogenbench.exe clone HumanEval
+cd HumanEval
+..\.venv\Scripts\autogenbench.exe run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl
 ```
 
 ## 6. 当前没有完成的真实 API / benchmark 工作
@@ -549,28 +563,29 @@ OPENAI_API_KEY=missing
 OAI_CONFIG_LIST=missing
 OAI_CONFIG_LIST_FILE=missing
 Docker version 28.5.1
-autogenbench: not installed in .venv
+autogenbench: cli smoke ok in .venv
 ```
 
 结论：
 
 - Docker 已安装。
+- AutoGenBench CLI 已安装并能启动。
 - 但当前没有可用 API 配置。
 - 因此本轮没有跑真实 AutoGenBench，也没有伪造任何 cached token / latency / cost 结果。
 
-后续要跑真实 AutoGenBench 时，建议先在 `.venv` 中安装：
+后续要跑真实 AutoGenBench 时，若需要重建 `.venv`，建议固定兼容依赖：
 
 ```powershell
-.venv\Scripts\python.exe -m pip install autogenbench
+.venv\Scripts\python.exe -m pip install autogenbench "pyautogen==0.2.35"
 ```
 
 然后准备 `OAI_CONFIG_LIST` 或 `OPENAI_API_KEY`，再按 AutoGenBench 官方方式跑：
 
 ```powershell
-autogenbench clone HumanEval
+.venv\Scripts\autogenbench.exe clone HumanEval
 cd HumanEval
-autogenbench run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl
-autogenbench tabulate Results/human_eval_two_agents
+..\.venv\Scripts\autogenbench.exe run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl
+..\.venv\Scripts\autogenbench.exe tabulate Results/human_eval_two_agents
 ```
 
 正式 A/B 应至少分两组：
@@ -658,7 +673,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 4. `rewrite_messages` 仍只支持移动同一个 system message 内的文本 block。
 5. Utility 估计和 summary 现在仍是字符级 / signature 级 proxy，不是真实 tokenizer / provider cached token。
 6. Semantic guard 现在是接口和 fake judge 测试，还没有接真实本地小模型。
-7. readiness checker 显示当前没有 API 配置，且 `.venv` 里还没有安装 `autogenbench`，所以没有真实 API cache / latency / cost 结果。
+7. readiness checker 显示当前没有 API 配置；AutoGenBench CLI 已在 `.venv` 中通过 smoke test，但还没有真实 API cache / latency / cost 结果。
 
 ## 9. 本轮产物清单
 
@@ -688,7 +703,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-20 passed
+22 passed
 ```
 
 命令行 smoke：
@@ -702,5 +717,5 @@ Readiness：
 
 ```text
 .venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
-ready=false, api_config=missing, autogenbench=not installed
+ready=false, api_config=missing, autogenbench=cli_smoke_ok
 ```
