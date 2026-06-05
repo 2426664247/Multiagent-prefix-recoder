@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from typing import Any, AsyncGenerator, Literal, Mapping, Optional, Sequence, Union
 
 import pytest
@@ -29,7 +30,10 @@ from autogen_prefix_tree import (
     Movability,
     PrefixPlan,
     PrefixReorderClient,
+    PrefixTree,
+    PrefixTreeNode,
     SemanticType,
+    ShareScope,
     rewrite_messages,
 )
 
@@ -159,6 +163,33 @@ def _semantic_blocks(result, semantic_type: SemanticType):
     return [block for block in result.blocks if block.semantic_type == semantic_type]
 
 
+def _tree_block_ids(node: PrefixTreeNode) -> tuple[str, ...]:
+    ids = list(node.block_ids)
+    for child in node.children:
+        ids.extend(_tree_block_ids(child))
+    return tuple(ids)
+
+
+def _single_leaf_tree(order: tuple[str, ...]) -> PrefixTree:
+    return PrefixTree(
+        session_id="unit",
+        root=PrefixTreeNode(
+            node_id="unit:root",
+            scope=ShareScope.GLOBAL,
+            label="global_shared_prefix",
+            children=(
+                PrefixTreeNode(
+                    node_id="unit:leaf",
+                    scope=ShareScope.AGENT,
+                    label="agent_local_suffix",
+                    block_ids=order,
+                ),
+            ),
+        ),
+        leaf_path=("root", "leaf"),
+    )
+
+
 def test_compiler_classifies_autogen_typed_messages() -> None:
     compiler = LocalPromptCompiler()
     messages: list[LLMMessage] = [
@@ -212,6 +243,10 @@ def test_planner_uses_exact_hash_history_before_reordering() -> None:
     assert SemanticType.ROLE_IDENTITY not in moved_types
     assert SemanticType.SHARED_CONTEXT in moved_types
     assert SemanticType.GLOBAL_TASK_BACKGROUND in moved_types
+    assert second_plan.prefix_tree is not None
+    assert Counter(_tree_block_ids(second_plan.prefix_tree.root)) == Counter(block.block_id for block in second.blocks)
+    assert second_plan.cacheable_prefix_blocks == second_plan.new_order[: len(second_plan.cacheable_prefix_blocks)]
+    assert second_plan.prefix_tree.root.block_ids == second_plan.cacheable_prefix_blocks
 
 
 def test_prefix_reorder_client_delegates_rewritten_messages_after_shared_evidence() -> None:
@@ -233,6 +268,8 @@ def test_prefix_reorder_client_delegates_rewritten_messages_after_shared_evidenc
     assert client.last_validation_report is not None
     assert client.last_validation_report.applied is True
     assert client.last_validation_report.fallback is False
+    assert client.last_validation_report.utility_estimate is not None
+    assert client.last_validation_report.utility_estimate.estimated_gain_chars > 0
 
 
 def test_prefix_reorder_client_falls_back_when_pipeline_raises() -> None:
@@ -277,6 +314,7 @@ def test_validator_rejects_forbidden_block_movement() -> None:
         moved_blocks=(role_block.block_id,),
         kept_blocks=tuple(block_id for block_id in original_ids if block_id != role_block.block_id),
         move_reason={role_block.block_id: "illegal test move"},
+        prefix_tree=_single_leaf_tree(new_order),
     )
 
     report = validator.validate(
@@ -300,6 +338,7 @@ def test_validator_rejects_tools_hash_changes() -> None:
         moved_blocks=(),
         kept_blocks=tuple(block.block_id for block in result.blocks),
         move_reason={},
+        prefix_tree=_single_leaf_tree(tuple(block.block_id for block in result.blocks)),
     )
 
     report = validator.validate(
@@ -312,6 +351,53 @@ def test_validator_rejects_tools_hash_changes() -> None:
 
     assert report.fallback is True
     assert report.reason == "tools_hash_changed"
+
+
+def test_validator_rejects_prefix_tree_coverage_mismatch() -> None:
+    compiler = LocalPromptCompiler()
+    validator = CacheUtilityValidator()
+    result = compiler.compile(_messages("planner"))
+    original_ids = tuple(block.block_id for block in result.blocks)
+    bad_tree = _single_leaf_tree(original_ids[:-1])
+    plan = PrefixPlan(
+        original_order=original_ids,
+        new_order=original_ids,
+        moved_blocks=(),
+        kept_blocks=original_ids,
+        move_reason={},
+        prefix_tree=bad_tree,
+    )
+
+    report = validator.validate(
+        original_messages=result.messages,
+        rewritten_messages=result.messages,
+        compile_result=result,
+        plan=plan,
+    )
+
+    assert report.fallback is True
+    assert report.reason == "prefix_tree_block_coverage_mismatch"
+
+
+def test_validator_rejects_rewritten_content_mismatch() -> None:
+    compiler = LocalPromptCompiler()
+    planner = HierarchicalPrefixPlanner()
+    validator = CacheUtilityValidator()
+    planner.plan(compiler.compile(_messages("planner"), session_id="unit"), session_id="unit")
+    result = compiler.compile(_messages("engineer"), session_id="unit")
+    plan = planner.plan(result, session_id="unit")
+    rewritten = list(rewrite_messages(result, plan))
+    rewritten[0] = rewritten[0].model_copy(update={"content": "tampered"})
+
+    report = validator.validate(
+        original_messages=result.messages,
+        rewritten_messages=rewritten,
+        compile_result=result,
+        plan=plan,
+    )
+
+    assert report.fallback is True
+    assert report.reason == "rewritten_content_mismatch"
 
 
 def test_rewrite_preserves_block_hash_multiset_and_message_type() -> None:
@@ -335,4 +421,3 @@ def test_prefix_reorder_client_is_autogen_chat_completion_client() -> None:
     assert isinstance(client, ChatCompletionClient)
     assert client.model_info["family"] == ModelFamily.UNKNOWN
     assert client.count_tokens(_messages("planner")) == 1
-

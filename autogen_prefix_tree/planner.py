@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ir import CompileResult, Movability, PromptBlock, SemanticType, ShareScope
+from .ir import CompileResult, Movability, PrefixTree, PrefixTreeNode, PromptBlock, SemanticType, ShareScope
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class PrefixPlan:
     moved_blocks: tuple[str, ...]
     kept_blocks: tuple[str, ...]
     move_reason: dict[str, str]
+    cacheable_prefix_blocks: tuple[str, ...] = ()
+    prefix_tree: PrefixTree | None = None
     risk_notes: tuple[str, ...] = ()
     fallback_required: bool = False
     fallback_reason: str | None = None
@@ -27,7 +29,15 @@ class _SeenBlock:
 
 
 class HierarchicalPrefixPlanner:
-    """保守 planner：第一版只把 exact hash 已观察到的共享 system block 提到前缀。"""
+    """保守 planner：只把有 exact-hash 复用证据的共享 system block 放进 prefix tree。"""
+
+    _semantic_priority: dict[SemanticType, int] = {
+        SemanticType.GLOBAL_TASK_BACKGROUND: 10,
+        SemanticType.SHARED_CONTEXT: 20,
+        SemanticType.TEAM_POLICY: 30,
+        SemanticType.SHARED_TOOL_DESCRIPTION: 40,
+        SemanticType.OUTPUT_FORMAT: 50,
+    }
 
     def __init__(self) -> None:
         self._seen_by_session: dict[str, dict[str, _SeenBlock]] = defaultdict(dict)
@@ -37,16 +47,22 @@ class HierarchicalPrefixPlanner:
         blocks = compile_result.blocks
         original_order = tuple(block.block_id for block in blocks)
         if not blocks:
+            prefix_tree = self._build_prefix_tree((), (), (), blocks, effective_session_id)
             return PrefixPlan(
                 original_order=original_order,
                 new_order=original_order,
                 moved_blocks=(),
                 kept_blocks=original_order,
                 move_reason={},
+                prefix_tree=prefix_tree,
             )
 
-        candidates = [block for block in blocks if self._can_promote(block, compile_result, effective_session_id)]
-        prefix_ids = tuple(block.block_id for block in candidates)
+        candidates = self._rank_candidates(
+            [block for block in blocks if self._can_promote(block, compile_result, effective_session_id)]
+        )
+        global_candidates = tuple(block for block in candidates if block.share_scope == ShareScope.GLOBAL)
+        subgroup_candidates = tuple(block for block in candidates if block.share_scope == ShareScope.SUBGROUP)
+        prefix_ids = tuple(block.block_id for block in (*global_candidates, *subgroup_candidates))
         new_order = prefix_ids + tuple(block.block_id for block in blocks if block.block_id not in set(prefix_ids))
 
         moved_blocks = tuple(
@@ -55,7 +71,7 @@ class HierarchicalPrefixPlanner:
             if original_order.index(block.block_id) != new_order.index(block.block_id)
         )
         move_reason = {
-            block.block_id: "exact_hash_seen_in_session_and_marked_shared_prefix"
+            block.block_id: self._move_reason(block)
             for block in candidates
             if block.block_id in moved_blocks
         }
@@ -65,12 +81,15 @@ class HierarchicalPrefixPlanner:
             if block.movability in {Movability.LOCAL_ONLY, Movability.ORDER_SENSITIVE, Movability.NEVER_MOVE}
         )
 
+        prefix_tree = self._build_prefix_tree(global_candidates, subgroup_candidates, new_order, blocks, effective_session_id)
         plan = PrefixPlan(
             original_order=original_order,
             new_order=new_order,
             moved_blocks=moved_blocks,
             kept_blocks=tuple(block_id for block_id in original_order if block_id not in moved_blocks),
             move_reason=move_reason,
+            cacheable_prefix_blocks=prefix_ids,
+            prefix_tree=prefix_tree,
             risk_notes=risk_notes,
         )
         self.observe(compile_result, session_id=effective_session_id)
@@ -103,6 +122,73 @@ class HierarchicalPrefixPlanner:
 
         seen = self._seen_by_session.get(session_id, {}).get(block.content_hash)
         return seen is not None and seen.count > 0
+
+    def _rank_candidates(self, candidates: list[PromptBlock]) -> tuple[PromptBlock, ...]:
+        return tuple(
+            sorted(
+                candidates,
+                key=lambda block: (
+                    0 if block.share_scope == ShareScope.GLOBAL else 1,
+                    self._semantic_priority.get(block.semantic_type, 100),
+                    block.original_position.message_index,
+                    block.original_position.part_index,
+                    block.block_id,
+                ),
+            )
+        )
+
+    def _move_reason(self, block: PromptBlock) -> str:
+        return (
+            "exact_hash_seen_in_session_and_prefix_tree_scope="
+            f"{block.share_scope.value};semantic_type={block.semantic_type.value}"
+        )
+
+    def _build_prefix_tree(
+        self,
+        global_candidates: tuple[PromptBlock, ...],
+        subgroup_candidates: tuple[PromptBlock, ...],
+        new_order: tuple[str, ...],
+        blocks: tuple[PromptBlock, ...],
+        session_id: str,
+    ) -> PrefixTree:
+        global_ids = tuple(block.block_id for block in global_candidates)
+        subgroup_ids = tuple(block.block_id for block in subgroup_candidates)
+        shared_ids = set(global_ids) | set(subgroup_ids)
+        leaf_ids = tuple(block_id for block_id in new_order if block_id not in shared_ids)
+
+        leaf = PrefixTreeNode(
+            node_id=f"{session_id}:leaf",
+            scope=ShareScope.AGENT,
+            label="agent_local_suffix",
+            block_ids=leaf_ids,
+        )
+        if subgroup_ids:
+            subgroup = PrefixTreeNode(
+                node_id=f"{session_id}:subgroup",
+                scope=ShareScope.SUBGROUP,
+                label="subgroup_shared_prefix",
+                block_ids=subgroup_ids,
+                children=(leaf,),
+            )
+            children = (subgroup,)
+            leaf_path = ("root", "subgroup", "leaf")
+        else:
+            children = (leaf,)
+            leaf_path = ("root", "leaf")
+
+        root = PrefixTreeNode(
+            node_id=f"{session_id}:root",
+            scope=ShareScope.GLOBAL,
+            label="global_shared_prefix",
+            block_ids=global_ids,
+            children=children,
+        )
+        tree = PrefixTree(session_id=session_id, root=root, leaf_path=leaf_path)
+
+        # 冷启动时没有可移动 block，leaf 仍然承载全部 block，确保整棵树覆盖当前请求。
+        if not blocks and not global_ids and not subgroup_ids:
+            return tree
+        return tree
 
     def _first_system_message_index(self, compile_result: CompileResult) -> int | None:
         for block in compile_result.blocks:

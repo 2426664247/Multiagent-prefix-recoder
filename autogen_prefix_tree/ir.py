@@ -64,6 +64,22 @@ class PromptBlock:
 
 
 @dataclass(frozen=True)
+class PrefixTreeNode:
+    node_id: str
+    scope: ShareScope
+    label: str
+    block_ids: tuple[str, ...] = ()
+    children: tuple["PrefixTreeNode", ...] = ()
+
+
+@dataclass(frozen=True)
+class PrefixTree:
+    session_id: str
+    root: PrefixTreeNode
+    leaf_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class CompileResult:
     messages: Sequence[Any]
     blocks: tuple[PromptBlock, ...]
@@ -114,4 +130,3 @@ def hash_model_args(tool_choice: Any, json_output: Any, extra_create_args: Mappi
             "extra_create_args": dict(extra_create_args or {}),
         }
     )
-
