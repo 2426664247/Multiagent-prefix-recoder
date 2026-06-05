@@ -147,6 +147,28 @@ print(summary.to_dict())
 - `total_estimated_gain_chars`
 - repeated reusable prefix 是否形成
 
+## Evaluation Readiness
+
+真实 AutoGenBench / API 运行前可以先检查环境：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
+```
+
+检查项：
+
+- 是否在本仓库 `.venv` 中运行
+- Docker 是否可用
+- `OPENAI_API_KEY` / `OAI_CONFIG_LIST` 是否存在
+- `autogenbench` 是否安装
+- `autogen_core` 是否安装
+
+这个命令只报告密钥配置是否存在，不读取或打印密钥内容。当前如果还没有 API 配置，可以先用宽松模式检查其他前置条件：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd . --allow-missing-api --allow-missing-autogenbench
+```
+
 ## 本地验证
 
 建议始终在仓库本地虚拟环境中运行：

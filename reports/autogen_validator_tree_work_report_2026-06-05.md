@@ -142,6 +142,37 @@ F:/CodexProject/MutilAgent
 
 第一次运行时出现过一个 `runpy` warning，原因是 `autogen_prefix_tree.__init__` 顶层提前 import 了 `microbench`，再用 `python -m autogen_prefix_tree.microbench` 会导致模块预加载。随后把 `microbench` 从顶层 `__init__` 导出移除，改为通过 `autogen_prefix_tree.microbench` 子模块导入，CLI warning 消失。
 
+继续补充 AutoGenBench readiness checker 后再次运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+20 passed
+```
+
+严格 readiness 检查：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
+```
+
+当前结果：
+
+```text
+python_environment: ok
+docker: ok, Docker version 28.5.1
+api_config: missing
+autogenbench: not installed
+autogen_core: ok
+ready: false
+```
+
+这说明真实 API / AutoGenBench 评测当前还差两步：准备 `OPENAI_API_KEY` 或 `OAI_CONFIG_LIST`，以及在 `.venv` 中安装 `autogenbench`。
+
 ## 4. 参考的 AutoGen 官方评测思路
 
 我查阅了 AutoGen 官方资料，主要参考：
@@ -245,7 +276,7 @@ Validator 现在额外检查：
 
 注意：这还不是 provider 返回的真实 cached tokens。后续接真实 API 时，需要把它和 API usage 里的 cached tokens、latency、cost 对齐。
 
-### 5.4 测试：从 9 个增加到 18 个
+### 5.4 测试：从 9 个增加到 20 个
 
 文件：`tests/test_native_prefix_reorder.py`
 
@@ -265,11 +296,12 @@ Validator 现在额外检查：
 - semantic guard 拒绝时强制 fallback。
 - semantic guard 抛异常时 fail closed。
 - microbenchmark 能写出 telemetry JSONL 和 summary JSON。
+- readiness checker 能识别 API 配置缺失，且不输出 secret 值。
 
 最终测试结果：
 
 ```text
-18 passed
+20 passed
 ```
 
 ### 5.5 测试配置
@@ -461,6 +493,53 @@ validation_reason_counts = {"no_rewrite_needed": 1, "validated": 2}
 
 这不是替代真实 AutoGenBench，而是给真实 API 前提供一个本地 smoke test：如果未来改 compiler/planner/validator 后 microbenchmark 都无法形成 warm prefix，就不应直接跑昂贵的真实 API。
 
+### 5.11 AutoGenBench/API Readiness Checker
+
+新增文件：`autogen_prefix_tree/readiness.py`
+
+目的：
+
+真实 API benchmark 前需要确认环境已经具备：
+
+- 本仓库本地 `.venv`
+- Docker
+- API 配置
+- `autogenbench`
+- `autogen_core`
+
+命令：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
+```
+
+如果只想检查除 API/autogenbench 外的其他条件：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd . --allow-missing-api --allow-missing-autogenbench
+```
+
+安全边界：
+
+- 只报告 `OPENAI_API_KEY` / `OAI_CONFIG_LIST` 是否存在。
+- 不读取 `OAI_CONFIG_LIST` 内容。
+- 不打印任何密钥值。
+
+当前严格检查结果是 not ready：
+
+```text
+api_config = missing
+autogenbench = not installed
+```
+
+这一步让真实评测的阻塞条件变成可执行清单，而不是口头说明。下一步一旦提供 API 配置，可先执行：
+
+```powershell
+.venv\Scripts\python.exe -m pip install autogenbench
+autogenbench clone HumanEval
+autogenbench run --subsample 0.1 --repeat 3 Tasks/human_eval_two_agents.jsonl
+```
+
 ## 6. 当前没有完成的真实 API / benchmark 工作
 
 我检查了当前环境：
@@ -579,7 +658,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 4. `rewrite_messages` 仍只支持移动同一个 system message 内的文本 block。
 5. Utility 估计和 summary 现在仍是字符级 / signature 级 proxy，不是真实 tokenizer / provider cached token。
 6. Semantic guard 现在是接口和 fake judge 测试，还没有接真实本地小模型。
-7. 没有 API key，所以没有真实 API cache / latency / cost 结果。
+7. readiness checker 显示当前没有 API 配置，且 `.venv` 里还没有安装 `autogenbench`，所以没有真实 API cache / latency / cost 结果。
 
 ## 9. 本轮产物清单
 
@@ -593,6 +672,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 - `autogen_prefix_tree/telemetry.py`
 - `autogen_prefix_tree/semantic_guard.py`
 - `autogen_prefix_tree/microbench.py`
+- `autogen_prefix_tree/readiness.py`
 
 测试：
 
@@ -608,7 +688,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-18 passed
+20 passed
 ```
 
 命令行 smoke：
@@ -616,4 +696,11 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 ```text
 .venv\Scripts\python.exe -m autogen_prefix_tree.microbench --telemetry tmp\prefix_microbench\requests.jsonl --summary tmp\prefix_microbench\summary.json --repeats 1
 request_count=3, applied_count=2, fallback_count=0
+```
+
+Readiness：
+
+```text
+.venv\Scripts\python.exe -m autogen_prefix_tree.readiness --cwd .
+ready=false, api_config=missing, autogenbench=not installed
 ```
