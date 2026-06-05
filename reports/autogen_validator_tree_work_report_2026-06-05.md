@@ -113,6 +113,35 @@ F:/CodexProject/MutilAgent
 17 passed
 ```
 
+继续补充离线 microbenchmark harness 后再次运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+18 passed
+```
+
+并实际运行了一次命令行 microbenchmark：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.microbench `
+  --telemetry tmp\prefix_microbench\requests.jsonl `
+  --summary tmp\prefix_microbench\summary.json `
+  --repeats 1
+```
+
+输出摘要：
+
+```json
+{"request_count": 3, "applied_count": 2, "fallback_count": 0, "total_estimated_gain_chars": 894}
+```
+
+第一次运行时出现过一个 `runpy` warning，原因是 `autogen_prefix_tree.__init__` 顶层提前 import 了 `microbench`，再用 `python -m autogen_prefix_tree.microbench` 会导致模块预加载。随后把 `microbench` 从顶层 `__init__` 导出移除，改为通过 `autogen_prefix_tree.microbench` 子模块导入，CLI warning 消失。
+
 ## 4. 参考的 AutoGen 官方评测思路
 
 我查阅了 AutoGen 官方资料，主要参考：
@@ -216,7 +245,7 @@ Validator 现在额外检查：
 
 注意：这还不是 provider 返回的真实 cached tokens。后续接真实 API 时，需要把它和 API usage 里的 cached tokens、latency、cost 对齐。
 
-### 5.4 测试：从 9 个增加到 17 个
+### 5.4 测试：从 9 个增加到 18 个
 
 文件：`tests/test_native_prefix_reorder.py`
 
@@ -235,11 +264,12 @@ Validator 现在额外检查：
 - semantic guard 通过时允许重排并写 telemetry。
 - semantic guard 拒绝时强制 fallback。
 - semantic guard 抛异常时 fail closed。
+- microbenchmark 能写出 telemetry JSONL 和 summary JSON。
 
 最终测试结果：
 
 ```text
-17 passed
+18 passed
 ```
 
 ### 5.5 测试配置
@@ -380,6 +410,57 @@ client = PrefixReorderClient(inner_client, validator=validator)
 
 这一步没有真正调用本地小模型，但完成了 Validator 与本地语义判断模块的协作接口。后续接模型时，需要重点设计 judge prompt：例如询问当前 agent 身份、最新用户指令、private/shared 边界、tool result 对应关系是否仍然清楚。
 
+### 5.10 Offline Microbenchmark Harness
+
+新增文件：`autogen_prefix_tree/microbench.py`
+
+这个 harness 用 AutoGen typed `SystemMessage` 构造一个最小三 agent 请求序列：
+
+```text
+planner -> engineer -> reviewer
+```
+
+每个请求都包含：
+
+- role-specific instruction
+- shared user task
+- shared groupchat context
+- team policy
+- shared tool schema
+- current turn instruction
+
+它使用 `_NoopClient` 作为 inner client，不调用网络、不读取 API key、不产生真实模型输出。目的只是验证插件链路：
+
+```text
+SystemMessage
+  -> LocalPromptCompiler
+  -> HierarchicalPrefixPlanner
+  -> CacheUtilityValidator
+  -> PrefixReorderClient telemetry
+  -> summarize_telemetry
+```
+
+命令：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.microbench `
+  --telemetry tmp\prefix_microbench\requests.jsonl `
+  --summary tmp\prefix_microbench\summary.json `
+  --repeats 1
+```
+
+一次默认运行的期望形态：
+
+```text
+request_count = 3
+no_rewrite_count = 1
+applied_count = 2
+fallback_count = 0
+validation_reason_counts = {"no_rewrite_needed": 1, "validated": 2}
+```
+
+这不是替代真实 AutoGenBench，而是给真实 API 前提供一个本地 smoke test：如果未来改 compiler/planner/validator 后 microbenchmark 都无法形成 warm prefix，就不应直接跑昂贵的真实 API。
+
 ## 6. 当前没有完成的真实 API / benchmark 工作
 
 我检查了当前环境：
@@ -511,6 +592,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 - `autogen_prefix_tree/client.py`
 - `autogen_prefix_tree/telemetry.py`
 - `autogen_prefix_tree/semantic_guard.py`
+- `autogen_prefix_tree/microbench.py`
 
 测试：
 
@@ -526,5 +608,12 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-17 passed
+18 passed
+```
+
+命令行 smoke：
+
+```text
+.venv\Scripts\python.exe -m autogen_prefix_tree.microbench --telemetry tmp\prefix_microbench\requests.jsonl --summary tmp\prefix_microbench\summary.json --repeats 1
+request_count=3, applied_count=2, fallback_count=0
 ```

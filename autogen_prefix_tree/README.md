@@ -127,6 +127,26 @@ print(summary.to_dict())
 - `repeated_prefix_request_count` / `repeated_prefix_rate`
 - `unique_reusable_prefix_count`
 
+## Offline Microbenchmark
+
+在没有 API key / AutoGenBench 环境时，可以先跑包内 microbenchmark，验证 AutoGen typed message -> compiler -> planner -> validator -> telemetry 的链路：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.microbench `
+  --telemetry tmp\prefix_microbench\requests.jsonl `
+  --summary tmp\prefix_microbench\summary.json `
+  --repeats 1
+```
+
+它使用 no-op inner client，不会调用网络，也不会记录 prompt 正文。输出的 `summary.json` 可用于快速检查：
+
+- cold request 是否 `no_rewrite_needed`
+- warm request 是否 `validated`
+- `applied_count`
+- `fallback_count`
+- `total_estimated_gain_chars`
+- repeated reusable prefix 是否形成
+
 ## 本地验证
 
 建议始终在仓库本地虚拟环境中运行：
