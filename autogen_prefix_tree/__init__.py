@@ -11,7 +11,7 @@ from .ir import (
     ShareScope,
 )
 from .planner import HierarchicalPrefixPlanner, PrefixPlan, rewrite_messages
-from .telemetry import JsonlTelemetryLogger, TelemetrySink
+from .telemetry import JsonlTelemetryLogger, TelemetrySink, TelemetrySummary, load_jsonl_telemetry, summarize_telemetry
 from .validator import CacheUtilityEstimate, CacheUtilityValidator, ValidationReport
 
 __all__ = [
@@ -31,6 +31,9 @@ __all__ = [
     "SemanticType",
     "ShareScope",
     "TelemetrySink",
+    "TelemetrySummary",
     "ValidationReport",
+    "load_jsonl_telemetry",
     "rewrite_messages",
+    "summarize_telemetry",
 ]

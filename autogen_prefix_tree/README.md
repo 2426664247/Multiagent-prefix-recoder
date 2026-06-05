@@ -75,6 +75,28 @@ model_client = PrefixReorderClient(
 
 这套字段用于后续 AutoGenBench 或真实 API A/B 测试：插件侧记录 planner/validator 行为，provider 侧再补充 cached tokens、latency 和 cost。
 
+离线汇总：
+
+```python
+from autogen_prefix_tree import load_jsonl_telemetry, summarize_telemetry
+
+records = load_jsonl_telemetry("runs/prefix_reorder_requests.jsonl")
+summary = summarize_telemetry(records)
+print(summary.to_dict())
+```
+
+当前 summary 是 provider-independent 的估计指标，主要用于没有真实 API usage 时先判断规则是否常触发、是否频繁 fallback、是否形成重复可复用前缀：
+
+- `request_count`
+- `applied_count` / `applied_rate`
+- `fallback_count` / `fallback_rate`
+- `validation_reason_counts`
+- `moved_block_count`
+- `total_estimated_gain_chars`
+- `reusable_prefix_request_count`
+- `repeated_prefix_request_count` / `repeated_prefix_rate`
+- `unique_reusable_prefix_count`
+
 ## 本地验证
 
 建议始终在仓库本地虚拟环境中运行：

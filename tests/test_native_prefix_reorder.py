@@ -35,7 +35,9 @@ from autogen_prefix_tree import (
     PrefixTreeNode,
     SemanticType,
     ShareScope,
+    load_jsonl_telemetry,
     rewrite_messages,
+    summarize_telemetry,
 )
 
 
@@ -310,6 +312,30 @@ def test_prefix_reorder_client_writes_jsonl_telemetry(tmp_path) -> None:
     assert [row["request_index"] for row in rows] == [1, 2]
     assert rows[0]["validation"]["reason"] == "no_rewrite_needed"
     assert rows[1]["validation"]["reason"] == "validated"
+
+
+def test_telemetry_summary_counts_reuse_and_validation_reasons(tmp_path) -> None:
+    inner = FakeClient()
+    telemetry_path = tmp_path / "requests.jsonl"
+    client = PrefixReorderClient(inner, session_id="team", telemetry_log_path=telemetry_path)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+    asyncio.run(client.create(_messages("reviewer")))
+
+    records = load_jsonl_telemetry(telemetry_path)
+    summary = summarize_telemetry(records)
+
+    assert summary.request_count == 3
+    assert summary.no_rewrite_count == 1
+    assert summary.applied_count == 2
+    assert summary.fallback_count == 0
+    assert summary.validation_reason_counts == {"no_rewrite_needed": 1, "validated": 2}
+    assert summary.reusable_prefix_request_count == 2
+    assert summary.repeated_prefix_request_count == 1
+    assert summary.unique_reusable_prefix_count == 1
+    assert summary.total_estimated_gain_chars > 0
+    assert summary.to_dict()["applied_rate"] == pytest.approx(2 / 3)
 
 
 def test_prefix_reorder_client_falls_back_when_pipeline_raises() -> None:

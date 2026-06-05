@@ -89,6 +89,18 @@ F:/CodexProject/MutilAgent
 13 passed
 ```
 
+继续补充离线 utility analyzer 后再次运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+14 passed
+```
+
 ## 4. 参考的 AutoGen 官方评测思路
 
 我查阅了 AutoGen 官方资料，主要参考：
@@ -207,11 +219,12 @@ Validator 现在额外检查：
 - telemetry JSON 序列化后不包含测试 prompt 正文。
 - JSONL logger 能写入请求记录。
 - pipeline exception fallback 也会写 telemetry。
+- telemetry summary 能统计 apply/fallback/reuse 和 validation reason。
 
 最终测试结果：
 
 ```text
-13 passed
+14 passed
 ```
 
 ### 5.5 测试配置
@@ -271,6 +284,50 @@ client = PrefixReorderClient(
 - tools / model args hash
 
 为了避免 benchmark trace 泄露任务 prompt，当前 telemetry 不记录完整 prompt 正文，也不记录 block 文本内容，只记录 block id 和结构化 metadata。
+
+### 5.8 离线 Utility Analyzer
+
+在 `autogen_prefix_tree/telemetry.py` 中继续新增：
+
+- `TelemetrySummary`
+- `load_jsonl_telemetry(path)`
+- `summarize_telemetry(records)`
+
+这一步的目的不是替代真实 provider cached tokens，而是在还没有 API key / AutoGenBench 真实运行之前，先让本地和后续 benchmark telemetry 能被稳定汇总。
+
+当前 summary 字段包括：
+
+- `request_count`
+- `applied_count` / `applied_rate`
+- `fallback_count` / `fallback_rate`
+- `no_rewrite_count`
+- `validation_reason_counts`
+- `moved_block_count`
+- `total_original_prefix_chars`
+- `total_rewritten_prefix_chars`
+- `total_estimated_gain_chars`
+- `total_moved_block_chars`
+- `reusable_prefix_request_count`
+- `repeated_prefix_request_count` / `repeated_prefix_rate`
+- `unique_reusable_prefix_count`
+- `average_estimated_gain_chars`
+
+新增测试用三次 AutoGen-style 请求模拟 cold / warm / repeated warm：
+
+```text
+planner   -> no_rewrite_needed
+engineer  -> validated
+reviewer  -> validated
+```
+
+测试确认：
+
+- 三次请求都能被 JSONL 加载。
+- validation reason 统计为 `{"no_rewrite_needed": 1, "validated": 2}`。
+- 两次 reusable prefix request 中有一次是重复 signature。
+- `applied_rate == 2/3`。
+
+这个 analyzer 可以直接用于后续 AutoGenBench A/B：插件侧先输出 JSONL，再用 summary 看规则覆盖率、fallback 原因和可复用前缀是否稳定形成。
 
 ## 6. 当前没有完成的真实 API / benchmark 工作
 
@@ -388,7 +445,7 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 2. Planner 只支持 exact hash sharing，不支持规范化 hash 或语义等价。
 3. `subgroup` 结构已经有数据模型，但当前 compiler 还没有可靠推断 subgroup scope。
 4. `rewrite_messages` 仍只支持移动同一个 system message 内的文本 block。
-5. Utility 估计现在是字符级 proxy，不是真实 tokenizer / provider cached token。
+5. Utility 估计和 summary 现在仍是字符级 / signature 级 proxy，不是真实 tokenizer / provider cached token。
 6. 没有 API key，所以没有真实 API cache / latency / cost 结果。
 
 ## 9. 本轮产物清单
@@ -416,5 +473,5 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-13 passed
+14 passed
 ```
