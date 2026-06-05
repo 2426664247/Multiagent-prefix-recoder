@@ -11,6 +11,7 @@ from .ir import (
     ShareScope,
 )
 from .planner import HierarchicalPrefixPlanner, PrefixPlan, rewrite_messages
+from .telemetry import JsonlTelemetryLogger, TelemetrySink
 from .validator import CacheUtilityEstimate, CacheUtilityValidator, ValidationReport
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "CacheUtilityValidator",
     "CompileResult",
     "HierarchicalPrefixPlanner",
+    "JsonlTelemetryLogger",
     "LocalPromptCompiler",
     "Movability",
     "PrefixPlan",
@@ -28,6 +30,7 @@ __all__ = [
     "PromptBlock",
     "SemanticType",
     "ShareScope",
+    "TelemetrySink",
     "ValidationReport",
     "rewrite_messages",
 ]

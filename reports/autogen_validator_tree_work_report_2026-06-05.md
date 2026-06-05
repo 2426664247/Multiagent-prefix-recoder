@@ -77,6 +77,18 @@ F:/CodexProject/MutilAgent
 11 passed
 ```
 
+继续补充 telemetry 后再次运行：
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+结果：
+
+```text
+13 passed
+```
+
 ## 4. 参考的 AutoGen 官方评测思路
 
 我查阅了 AutoGen 官方资料，主要参考：
@@ -180,7 +192,7 @@ Validator 现在额外检查：
 
 注意：这还不是 provider 返回的真实 cached tokens。后续接真实 API 时，需要把它和 API usage 里的 cached tokens、latency、cost 对齐。
 
-### 5.4 测试：从 9 个增加到 11 个
+### 5.4 测试：从 9 个增加到 13 个
 
 文件：`tests/test_native_prefix_reorder.py`
 
@@ -191,11 +203,15 @@ Validator 现在额外检查：
 - wrapper 成功重排后，`ValidationReport.utility_estimate.estimated_gain_chars > 0`。
 - Validator 能拒绝 block 覆盖不完整的坏 tree。
 - Validator 能拒绝被篡改的 rewritten system content。
+- telemetry sink 能收到两次请求记录。
+- telemetry JSON 序列化后不包含测试 prompt 正文。
+- JSONL logger 能写入请求记录。
+- pipeline exception fallback 也会写 telemetry。
 
 最终测试结果：
 
 ```text
-11 passed in 0.26s
+13 passed
 ```
 
 ### 5.5 测试配置
@@ -215,7 +231,46 @@ Validator 现在额外检查：
 
 - planner 现在生成显式 prefix tree。
 - Validator 现在输出 utility estimate。
+- `PrefixReorderClient` 现在支持可选 telemetry sink / JSONL logger。
 - 推荐使用 `.venv\Scripts\python.exe -m pytest -q` 进行本地验证。
+
+### 5.7 Telemetry：为真实 benchmark 做请求级记录
+
+新增文件：`autogen_prefix_tree/telemetry.py`
+
+`PrefixReorderClient` 现在支持可选 telemetry：
+
+```python
+records = []
+client = PrefixReorderClient(inner_client, telemetry_sink=records.append)
+```
+
+或者写 JSONL：
+
+```python
+client = PrefixReorderClient(
+    inner_client,
+    telemetry_log_path="runs/prefix_reorder_requests.jsonl",
+)
+```
+
+默认不会写文件，只保留最近一次 `last_telemetry_record`。这样本地调试方便，也不会无意中生成大量日志。
+
+记录字段包括：
+
+- `session_id`
+- `request_index`
+- `operation`
+- 重排前后 message 类型和数量
+- `blocks_moved`
+- moved block 的 semantic type、movability、share scope、source role
+- `cacheable_prefix_blocks`
+- `prefix_tree`
+- Validator 的 `applied`、`fallback`、`reason`
+- `utility_estimate`
+- tools / model args hash
+
+为了避免 benchmark trace 泄露任务 prompt，当前 telemetry 不记录完整 prompt 正文，也不记录 block 文本内容，只记录 block id 和结构化 metadata。
 
 ## 6. 当前没有完成的真实 API / benchmark 工作
 
@@ -344,6 +399,8 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 - `autogen_prefix_tree/planner.py`
 - `autogen_prefix_tree/validator.py`
 - `autogen_prefix_tree/__init__.py`
+- `autogen_prefix_tree/client.py`
+- `autogen_prefix_tree/telemetry.py`
 
 测试：
 
@@ -359,5 +416,5 @@ AutoGenBench/HumanEval 主要验证 coding agent workflow，不足以覆盖所�
 
 ```text
 .venv\Scripts\python.exe -m pytest -q
-11 passed
+13 passed
 ```

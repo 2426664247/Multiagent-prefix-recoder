@@ -42,6 +42,39 @@ Validator 现在会额外检查：
 
 `ValidationReport.utility_estimate` 会给出轻量指标，包括原始/重写后可复用前缀字符数、移动 block 字符数、估计增益和前后 block 指纹。后续接真实 API 时，可以把这些字段和 provider 返回的 cached tokens、latency、cost 一起记录。
 
+## Telemetry
+
+`PrefixReorderClient` 支持可选请求级 telemetry。默认不会写文件，只把最近一次记录保存在 `last_telemetry_record`，方便调试。
+
+内存 sink：
+
+```python
+records = []
+model_client = PrefixReorderClient(inner_client, telemetry_sink=records.append)
+```
+
+JSONL 文件：
+
+```python
+model_client = PrefixReorderClient(
+    inner_client,
+    telemetry_log_path="runs/prefix_reorder_requests.jsonl",
+)
+```
+
+记录内容只包含结构化元数据，不包含 prompt 正文。主要字段：
+
+- `session_id` / `request_index` / `operation`
+- 重排前后的 message 类型和数量
+- `blocks_moved`、移动 block 的语义类型、可移动性和共享范围
+- `cacheable_prefix_blocks`
+- `prefix_tree`
+- Validator 的 `applied` / `fallback` / `reason`
+- `utility_estimate`
+- tools / model args hash
+
+这套字段用于后续 AutoGenBench 或真实 API A/B 测试：插件侧记录 planner/validator 行为，provider 侧再补充 cached tokens、latency 和 cost。
+
 ## 本地验证
 
 建议始终在仓库本地虚拟环境中运行：

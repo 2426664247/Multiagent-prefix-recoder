@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from typing import Any, AsyncGenerator, Literal, Mapping, Optional, Sequence, Union
 
@@ -272,6 +273,45 @@ def test_prefix_reorder_client_delegates_rewritten_messages_after_shared_evidenc
     assert client.last_validation_report.utility_estimate.estimated_gain_chars > 0
 
 
+def test_prefix_reorder_client_emits_prompt_safe_telemetry() -> None:
+    inner = FakeClient()
+    records: list[dict[str, Any]] = []
+    client = PrefixReorderClient(inner, session_id="team", telemetry_sink=records.append)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    assert len(records) == 2
+    assert records[0]["request_index"] == 1
+    assert records[1]["request_index"] == 2
+    assert records[1]["validation"] == {
+        "applied": True,
+        "fallback": False,
+        "reason": "validated",
+    }
+    assert records[1]["blocks_moved"]
+    assert records[1]["cacheable_prefix_blocks"]
+    assert records[1]["prefix_tree"]["root"]["label"] == "global_shared_prefix"
+    assert records[1]["utility_estimate"]["estimated_gain_chars"] > 0
+    serialized = json.dumps(records[1], ensure_ascii=False)
+    assert "AGENT_NAME: engineer" not in serialized
+    assert "Shared project context." not in serialized
+
+
+def test_prefix_reorder_client_writes_jsonl_telemetry(tmp_path) -> None:
+    inner = FakeClient()
+    telemetry_path = tmp_path / "telemetry" / "requests.jsonl"
+    client = PrefixReorderClient(inner, session_id="team", telemetry_log_path=telemetry_path)
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    rows = [json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["request_index"] for row in rows] == [1, 2]
+    assert rows[0]["validation"]["reason"] == "no_rewrite_needed"
+    assert rows[1]["validation"]["reason"] == "validated"
+
+
 def test_prefix_reorder_client_falls_back_when_pipeline_raises() -> None:
     inner = FakeClient()
     client = PrefixReorderClient(inner, compiler=FailingCompiler())
@@ -284,6 +324,8 @@ def test_prefix_reorder_client_falls_back_when_pipeline_raises() -> None:
     assert client.last_validation_report is not None
     assert client.last_validation_report.fallback is True
     assert client.last_validation_report.reason.startswith("pipeline_exception")
+    assert client.last_telemetry_record is not None
+    assert client.last_telemetry_record["validation"]["reason"].startswith("pipeline_exception")
 
 
 def test_create_stream_delegates_chunks_without_modifying_response() -> None:
