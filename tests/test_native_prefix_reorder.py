@@ -194,6 +194,10 @@ def _messages(agent: str) -> list[LLMMessage]:
     return [SystemMessage(content=_system_content(agent))]
 
 
+def _groupchat_messages(agent: str, *history: LLMMessage) -> list[LLMMessage]:
+    return [SystemMessage(content=_system_content(agent)), *history]
+
+
 def _semantic_blocks(result, semantic_type: SemanticType):
     return [block for block in result.blocks if block.semantic_type == semantic_type]
 
@@ -258,6 +262,53 @@ def test_compiler_classifies_autogen_typed_messages() -> None:
     assert _semantic_blocks(result, SemanticType.TOOL_RESULT)[0].movability == Movability.NEVER_MOVE
 
 
+def test_compiler_prefers_explicit_section_marker_over_broad_sensitive_keywords() -> None:
+    compiler = LocalPromptCompiler()
+    result = compiler.compile(
+        [
+            SystemMessage(
+                content=(
+                    "TEAM_POLICY_START\n"
+                    "Do not move private memory, latest user instructions, or tool results.\n"
+                    "TEAM_POLICY_END"
+                )
+            )
+        ]
+    )
+
+    assert result.blocks[0].semantic_type == SemanticType.TEAM_POLICY
+    assert result.blocks[0].movability == Movability.SAFE_PREFIX
+    assert result.blocks[0].share_scope == ShareScope.GLOBAL
+
+
+def test_compiler_can_opt_into_natural_language_system_segmentation() -> None:
+    compiler = LocalPromptCompiler(enable_natural_language_segmentation=True)
+    result = compiler.compile(
+        [
+            SystemMessage(
+                content=(
+                    "You are a helpful AI assistant.\n"
+                    "When using code, indicate the script type in the code block.\n"
+                    "Verify the answer carefully and include evidence.\n"
+                    "Reply with concise final results."
+                )
+            )
+        ]
+    )
+
+    assert result.blocks[0].semantic_type == SemanticType.ROLE_IDENTITY
+    assert result.blocks[0].movability == Movability.LOCAL_ONLY
+    assert any(block.semantic_type == SemanticType.SHARED_TOOL_DESCRIPTION for block in result.blocks)
+    assert any(block.semantic_type == SemanticType.TEAM_POLICY for block in result.blocks)
+    assert result.blocks[-1].semantic_type == SemanticType.UNKNOWN
+    assert result.blocks[-1].movability == Movability.ORDER_SENSITIVE
+    assert all(
+        block.share_scope == ShareScope.GLOBAL
+        for block in result.blocks
+        if block.semantic_type in {SemanticType.SHARED_TOOL_DESCRIPTION, SemanticType.TEAM_POLICY}
+    )
+
+
 def test_planner_uses_exact_hash_history_before_reordering() -> None:
     compiler = LocalPromptCompiler()
     planner = HierarchicalPrefixPlanner()
@@ -282,6 +333,64 @@ def test_planner_uses_exact_hash_history_before_reordering() -> None:
     assert Counter(_tree_block_ids(second_plan.prefix_tree.root)) == Counter(block.block_id for block in second.blocks)
     assert second_plan.cacheable_prefix_blocks == second_plan.new_order[: len(second_plan.cacheable_prefix_blocks)]
     assert second_plan.prefix_tree.root.block_ids == second_plan.cacheable_prefix_blocks
+
+
+def test_groupchat_history_reordering_is_opt_in() -> None:
+    compiler = LocalPromptCompiler()
+    planner = HierarchicalPrefixPlanner()
+    task = UserMessage(content="Solve the add(a, b) task.", source="user")
+    planner_history = UserMessage(content="Planner proposed writing focused tests first.", source="planner")
+
+    planner.plan(compiler.compile(_groupchat_messages("planner", task), session_id="history-off"), session_id="history-off")
+    result = compiler.compile(_groupchat_messages("engineer", task, planner_history), session_id="history-off")
+    plan = planner.plan(result, session_id="history-off")
+
+    moved_types = {
+        block.semantic_type
+        for block in result.blocks
+        if block.block_id in set(plan.moved_blocks)
+    }
+    assert SemanticType.CONVERSATION_HISTORY not in moved_types
+
+
+def test_groupchat_history_reordering_moves_repeated_dialogue_prefix_with_split_system_suffix() -> None:
+    compiler = LocalPromptCompiler(enable_groupchat_history_reordering=True)
+    planner = HierarchicalPrefixPlanner(enable_groupchat_history_reordering=True)
+    validator = CacheUtilityValidator()
+    task = UserMessage(content="Solve the add(a, b) task.", source="user")
+    planner_history = UserMessage(content="Planner proposed writing focused tests first.", source="planner")
+    engineer_history = UserMessage(content="Engineer wrote the add implementation.", source="engineer")
+
+    planner.plan(compiler.compile(_groupchat_messages("planner", task), session_id="history-on"), session_id="history-on")
+    planner.plan(
+        compiler.compile(_groupchat_messages("engineer", task, planner_history), session_id="history-on"),
+        session_id="history-on",
+    )
+    result = compiler.compile(
+        _groupchat_messages("reviewer", task, planner_history, engineer_history),
+        session_id="history-on",
+    )
+    plan = planner.plan(result, session_id="history-on")
+    rewritten = rewrite_messages(result, plan)
+    report = validator.validate(
+        original_messages=result.messages,
+        rewritten_messages=rewritten,
+        compile_result=result,
+        plan=plan,
+    )
+
+    blocks_by_id = {block.block_id: block for block in result.blocks}
+    moved_types = {blocks_by_id[block_id].semantic_type for block_id in plan.moved_blocks}
+    assert SemanticType.CONVERSATION_HISTORY in moved_types
+    assert report.applied is True
+    assert report.fallback is False
+    assert rewritten[0].type == "SystemMessage"
+    assert rewritten[0].content.startswith("USER_TASK_START")
+    assert rewritten[1] == task
+    assert rewritten[2] == planner_history
+    assert rewritten[3].type == "SystemMessage"
+    assert "AGENT_NAME: reviewer" in rewritten[3].content
+    assert rewritten[4] == engineer_history
 
 
 def test_prefix_reorder_client_delegates_rewritten_messages_after_shared_evidence() -> None:
