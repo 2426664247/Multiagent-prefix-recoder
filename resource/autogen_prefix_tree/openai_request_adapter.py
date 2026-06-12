@@ -15,12 +15,14 @@ from autogen_core.models import (
     UserMessage,
 )
 
+from .cache_estimator import observe_cache_estimator
 from .compiler import LocalPromptCompiler
 from .dataset_eval import openai_messages_to_autogen
+from .feedback import JsonlFeedbackLogger, PlannerFeedbackLearner
 from .planner import HierarchicalPrefixPlanner, rewrite_messages
 from .semantic_guard import OpenAICompatibleSemanticGuard
 from .shadow_trial import ShadowTrialPlan, evaluate_shadow_trial, load_shadow_trial_plan
-from .telemetry import JsonlTelemetryLogger, TelemetrySink, dataclass_to_dict, serialize_prefix_tree
+from .telemetry import JsonlTelemetryLogger, TelemetrySink, dataclass_to_dict, serialize_prefix_tree, serialize_prefix_tree_candidate
 from .validator import CacheUtilityValidator
 
 
@@ -58,17 +60,26 @@ class OpenAICompatibleRequestAdapter:
         shadow_trial_plan_path: str | Path | None = None,
         telemetry_sink: TelemetrySink | None = None,
         telemetry_log_path: str | Path | None = None,
+        feedback_learner: PlannerFeedbackLearner | None = None,
+        feedback_log_path: str | Path | None = None,
+        cache_estimator: str | Any | None = None,
     ) -> None:
         self.enable_natural_language_segmentation = enable_natural_language_segmentation
         self.enable_groupchat_history_reordering = enable_groupchat_history_reordering
+        self.feedback_learner = feedback_learner or PlannerFeedbackLearner(
+            feedback_sink=JsonlFeedbackLogger(feedback_log_path) if feedback_log_path is not None else None
+        )
         self.compiler = compiler or LocalPromptCompiler(
             enable_natural_language_segmentation=enable_natural_language_segmentation,
             enable_groupchat_history_reordering=enable_groupchat_history_reordering,
         )
         self.planner = planner or HierarchicalPrefixPlanner(
-            enable_groupchat_history_reordering=enable_groupchat_history_reordering
+            enable_groupchat_history_reordering=enable_groupchat_history_reordering,
+            feedback_policy=self.feedback_learner,
         )
-        self.validator = validator or CacheUtilityValidator()
+        if hasattr(self.planner, "feedback_policy") and getattr(self.planner, "feedback_policy") is None:
+            self.planner.feedback_policy = self.feedback_learner
+        self.validator = validator or CacheUtilityValidator(cache_estimator=cache_estimator)
         if shadow_trial_plan is not None and shadow_trial_plan_path is not None:
             raise ValueError("Pass either shadow_trial_plan or shadow_trial_plan_path, not both")
         self.shadow_trial_plan = (
@@ -81,6 +92,7 @@ class OpenAICompatibleRequestAdapter:
         self.session_id = session_id
         self.enabled = enabled
         self.last_result: OpenAIRequestRewriteResult | None = None
+        self.last_feedback_record: dict[str, Any] | None = None
         self._request_index = 0
         self._telemetry_sinks: list[TelemetrySink] = []
         if telemetry_sink is not None:
@@ -117,7 +129,9 @@ class OpenAICompatibleRequestAdapter:
                 report_fallback=True,
                 report_reason="disabled",
                 utility_estimate=None,
+                utility_preservation_report=None,
                 semantic_guard_report=None,
+                planner_feedback=None,
                 risk_notes=(),
             )
             return self._finish(body, rewritten_body, telemetry)
@@ -152,6 +166,14 @@ class OpenAICompatibleRequestAdapter:
             if not report.fallback:
                 prepared_messages = candidate_messages
                 rewritten_body["messages"] = autogen_messages_to_openai(prepared_messages, original_body_messages=body.get("messages"))
+            self._observe_cache_estimator(
+                compile_result=compile_result,
+                plan=plan,
+                original_messages=original_messages,
+                rewritten_messages=candidate_messages,
+                accepted=not report.fallback,
+            )
+            self._record_feedback(compile_result=compile_result, plan=plan, report=report)
             telemetry = self._build_telemetry_record(
                 request_index=request_index,
                 operation=operation,
@@ -164,8 +186,15 @@ class OpenAICompatibleRequestAdapter:
                 report_applied=report.applied,
                 report_fallback=report.fallback,
                 report_reason=report.reason,
+                report_hard_constraint_passed=report.hard_constraint_passed,
+                report_hard_constraint_report=report.hard_constraint_report,
+                report_utility_status=report.utility_status,
+                report_cache_hit_increased=report.cache_hit_increased,
+                cache_estimate_report=dataclass_to_dict(report.cache_estimate_report),
                 utility_estimate=dataclass_to_dict(report.utility_estimate),
+                utility_preservation_report=dataclass_to_dict(report.utility_preservation_report),
                 semantic_guard_report=dataclass_to_dict(report.semantic_guard_report),
+                planner_feedback=self.last_feedback_record,
                 risk_notes=report.risk_notes,
             )
             return self._finish(body, rewritten_body, telemetry)
@@ -182,8 +211,14 @@ class OpenAICompatibleRequestAdapter:
                 report_applied=False,
                 report_fallback=True,
                 report_reason=f"pipeline_exception:{type(exc).__name__}",
+                report_hard_constraint_passed=False,
+                report_hard_constraint_report=None,
+                report_utility_status="not_run",
+                report_cache_hit_increased=False,
                 utility_estimate=None,
+                utility_preservation_report=None,
                 semantic_guard_report=None,
+                planner_feedback=None,
                 risk_notes=(),
             )
             return self._finish(body, rewritten_body, telemetry)
@@ -204,6 +239,47 @@ class OpenAICompatibleRequestAdapter:
         self._request_index += 1
         return self._request_index
 
+    def _record_feedback(self, *, compile_result: Any, plan: Any, report: Any) -> None:
+        if compile_result is None or plan is None:
+            self.last_feedback_record = None
+            return
+        try:
+            record = self.feedback_learner.record(
+                compile_result=compile_result,
+                plan=plan,
+                validation_report=report,
+            )
+            self.last_feedback_record = record.to_dict()
+        except Exception as exc:  # noqa: BLE001
+            self.last_feedback_record = {
+                "schema_version": "prefix-planner-feedback-error-v1",
+                "prompt_safe_summary": True,
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+
+    def _observe_cache_estimator(
+        self,
+        *,
+        compile_result: Any,
+        plan: Any,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        accepted: bool,
+    ) -> None:
+        observe_cache_estimator(
+            self.validator.cache_estimator,
+            original_messages,
+            rewritten_messages,
+            accepted=accepted,
+            candidate=plan.prefix_tree_candidate,
+            context={
+                "compile_result": compile_result,
+                "plan": plan,
+                "session_id": compile_result.session_id,
+                "candidate": plan.prefix_tree_candidate,
+            },
+        )
+
     def _build_telemetry_record(
         self,
         *,
@@ -218,9 +294,16 @@ class OpenAICompatibleRequestAdapter:
         report_applied: bool,
         report_fallback: bool,
         report_reason: str,
-        utility_estimate: Mapping[str, Any] | None,
-        semantic_guard_report: Mapping[str, Any] | None,
-        risk_notes: Sequence[str],
+        report_hard_constraint_passed: bool = False,
+        report_hard_constraint_report: Mapping[str, Any] | None = None,
+        report_utility_status: str = "unverified",
+        report_cache_hit_increased: bool | None = None,
+        utility_estimate: Mapping[str, Any] | None = None,
+        cache_estimate_report: Mapping[str, Any] | None = None,
+        utility_preservation_report: Mapping[str, Any] | None = None,
+        semantic_guard_report: Mapping[str, Any] | None = None,
+        planner_feedback: Mapping[str, Any] | None = None,
+        risk_notes: Sequence[str] = (),
     ) -> dict[str, Any]:
         blocks = compile_result.blocks if compile_result is not None else ()
         return {
@@ -243,13 +326,27 @@ class OpenAICompatibleRequestAdapter:
             "blocks_moved": plan.moved_blocks if plan is not None else (),
             "cacheable_prefix_blocks": plan.cacheable_prefix_blocks if plan is not None else (),
             "prefix_tree": serialize_prefix_tree(plan.prefix_tree if plan is not None else None),
+            "prefix_tree_candidate": serialize_prefix_tree_candidate(
+                plan.prefix_tree_candidate if plan is not None else None,
+                include_text=False,
+            ),
+            "planner_score": plan.planner_score if plan is not None else None,
+            "planner_score_breakdown": plan.planner_score_breakdown if plan is not None else None,
+            "cache_gain_report": plan.cache_gain_report if plan is not None else None,
             "validation": {
                 "applied": report_applied,
                 "fallback": report_fallback,
                 "reason": report_reason,
             },
+            "hard_constraint_passed": report_hard_constraint_passed,
+            "hard_constraint_report": report_hard_constraint_report,
+            "utility_status": report_utility_status,
+            "cache_hit_increased": report_cache_hit_increased,
+            "cache_estimate_report": cache_estimate_report,
             "utility_estimate": utility_estimate,
+            "utility_preservation": utility_preservation_report,
             "semantic_guard": semantic_guard_report,
+            "planner_feedback": planner_feedback,
             "shadow_trial": evaluate_shadow_trial(self.shadow_trial_plan, blocks),
             "risk_notes": tuple(risk_notes),
             "hashes": {
@@ -333,6 +430,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Records shadow-only rule matches in telemetry without changing requests."
         ),
     )
+    parser.add_argument(
+        "--cache-estimator",
+        default="prefix-tree",
+        choices=("prefix-tree", "cache-hit-proxy", "provider-telemetry"),
+        help="Cache estimator for the cache hit gate. cache-hit-proxy falls back to prefix-tree if unavailable.",
+    )
     return parser
 
 
@@ -344,6 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         enable_natural_language_segmentation=args.enable_natural_language_segmentation,
         enable_groupchat_history_reordering=args.enable_groupchat_history_reordering,
         validator=_validator_from_args(args),
+        cache_estimator=args.cache_estimator,
         shadow_trial_plan_path=args.shadow_trial_plan,
     )
     output_path = Path(args.output)
@@ -364,10 +468,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _validator_from_args(args: argparse.Namespace) -> CacheUtilityValidator:
     if not args.semantic_guard_base_url:
-        return CacheUtilityValidator()
+        return CacheUtilityValidator(cache_estimator=args.cache_estimator)
     if not args.semantic_guard_model:
         raise ValueError("--semantic-guard-model is required when --semantic-guard-base-url is set")
     return CacheUtilityValidator(
+        cache_estimator=args.cache_estimator,
         semantic_guard=OpenAICompatibleSemanticGuard(
             base_url=args.semantic_guard_base_url,
             model=args.semantic_guard_model,

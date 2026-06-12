@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Utility Task",
+  "type": "object",
+  "required": [
+    "task_id",
+    "dataset_source",
+    "scenario_type",
+    "prompt_template_id",
+    "agents",
+    "expected_oracle_type",
+    "candidate_generation_config",
+    "prompt_text_included",
+    "created_at"
+  ],
+  "properties": {
+    "task_id": {"type": "string"},
+    "dataset_source": {
+      "type": "string",
+      "enum": ["humaneval", "synthetic_agent", "format_protocol", "role_privacy", "history_state"]
+    },
+    "scenario_type": {"type": "string"},
+    "prompt_template_id": {"type": "string"},
+    "agents": {"type": "array", "items": {"type": "string"}},
+    "original_messages": {"type": "array"},
+    "original_messages_ref": {"type": "string"},
+    "expected_oracle_type": {
+      "type": "string",
+      "enum": ["unit_test", "json_schema", "tool_trace", "state_check", "privacy_check", "role_check"]
+    },
+    "oracle_spec": {"type": "object"},
+    "oracle_spec_ref": {"type": "string"},
+    "candidate_generation_config": {"type": "object"},
+    "prompt_text_included": {"type": "boolean"},
+    "created_at": {"type": "string"}
+  },
+  "anyOf": [
+    {"required": ["original_messages"]},
+    {"required": ["original_messages_ref"]}
+  ],
+  "additionalProperties": true
+}

@@ -47,6 +47,9 @@ runs/**/*.local.md
 runs/**/local_judge_goldset_annotation_worklist.local.jsonl
 runs/**/local_judge_goldset_annotation_labels.local.jsonl
 runs/**/local_judge_goldset_labeled.local.jsonl
+datasets/**/local_artifacts/
+datasets/**/*with_text*.jsonl
+datasets/**/*.local.jsonl
 
 # Local trace output.
 cache_hit_proxy/traces/

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .ir import PrefixTree, PrefixTreeNode
+from .ir import PrefixTree, PrefixTreeCandidate, PrefixTreeNode
 
 TelemetrySink = Callable[[Mapping[str, Any]], None]
 
@@ -143,6 +143,51 @@ def serialize_prefix_tree(tree: PrefixTree | None) -> dict[str, Any] | None:
     }
 
 
+def serialize_prefix_tree_candidate(candidate: PrefixTreeCandidate | None, *, include_text: bool = False) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    row: dict[str, Any] = {
+        "candidate_id": candidate.candidate_id,
+        "root_node_id": candidate.root_node_id,
+        "nodes": {
+            node_id: _serialize_prefix_tree_node(node)
+            for node_id, node in candidate.nodes.items()
+        },
+        "agent_paths": dict(candidate.agent_paths),
+        "placements": tuple(
+            {
+                "placement_id": placement.placement_id,
+                "block_id": placement.block_id,
+                "block_hash": placement.block_hash,
+                "original_agent_id": placement.original_agent_id,
+                "original_position": dataclass_to_dict(placement.original_position),
+                "original_scope": _enum_value(placement.original_scope),
+                "target_scope": _enum_value(placement.target_scope),
+                "target_node_id": placement.target_node_id,
+                "target_agent_group": placement.target_agent_group,
+                "moved": placement.moved,
+                "risk_tags": placement.risk_tags,
+                "dependency_notes": placement.dependency_notes,
+                "cache_contribution": placement.cache_contribution,
+                "placement_score": placement.placement_score,
+                "placement_score_breakdown": placement.placement_score_breakdown,
+            }
+            for placement in candidate.placements
+        ),
+        "estimated_cache_gain": candidate.estimated_cache_gain,
+        "planner_score": candidate.planner_score,
+        "planner_score_breakdown": candidate.planner_score_breakdown,
+        "generation_reason": candidate.generation_reason,
+        "agent_block_orders": dict(candidate.agent_block_orders or {}),
+        "block_hash_by_id": dict(candidate.block_hash_by_id or {}),
+        "cache_gain_report": candidate.cache_gain_report,
+    }
+    if include_text:
+        row["materialized_prompts"] = dict(candidate.materialized_prompts or {})
+        row["block_text_by_id"] = dict(candidate.block_text_by_id or {})
+    return row
+
+
 def dataclass_to_dict(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -153,10 +198,21 @@ def _serialize_prefix_tree_node(node: PrefixTreeNode) -> dict[str, Any]:
     return {
         "node_id": node.node_id,
         "scope": node.scope.value,
+        "scope_type": _enum_value(node.scope_type),
         "label": node.label,
+        "agent_ids": node.agent_ids,
         "block_ids": node.block_ids,
+        "parent_id": node.parent_id,
+        "children_ids": node.children_ids,
+        "token_len": node.token_len,
+        "risk_tags": node.risk_tags,
+        "explanation": node.explanation,
         "children": tuple(_serialize_prefix_tree_node(child) for child in node.children),
     }
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
 
 
 def _safe_ratio(numerator: int, denominator: int) -> float:

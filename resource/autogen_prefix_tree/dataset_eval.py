@@ -420,6 +420,7 @@ def _build_eval_record(
             "fallback": report.fallback,
             "reason": report.reason,
         },
+        "cache_estimate_report": dataclass_to_dict(report.cache_estimate_report),
         "utility_estimate": dataclass_to_dict(report.utility_estimate),
         "semantic_guard": dataclass_to_dict(report.semantic_guard_report),
         "risk_notes": report.risk_notes,

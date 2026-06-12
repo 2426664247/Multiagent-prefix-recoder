@@ -29,6 +29,7 @@ from autogen_prefix_tree import (
     HierarchicalPrefixPlanner,
     LocalPromptCompiler,
     Movability,
+    PlannerFeedbackLearner,
     PrefixPlan,
     PrefixReorderClient,
     PrefixTree,
@@ -36,6 +37,8 @@ from autogen_prefix_tree import (
     SemanticGuardReport,
     SemanticType,
     ShareScope,
+    UtilityPreservationReport,
+    build_replay_run_record,
     load_jsonl_telemetry,
     rewrite_messages,
     summarize_telemetry,
@@ -175,6 +178,17 @@ class ThrowingSemanticGuard:
         raise RuntimeError("judge failed")
 
 
+class RejectingUtilityValidator:
+    def evaluate(self, **_: Any) -> UtilityPreservationReport:
+        return UtilityPreservationReport(
+            is_utility_preserved=False,
+            confidence=0.82,
+            reason="role_output_order_uncertain",
+            checks=("role_boundary", "output_format"),
+            model_name="fake-utility-judge",
+        )
+
+
 def _system_content(agent: str, shared: str = "Shared project context.") -> str:
     return "\n\n".join(
         [
@@ -253,7 +267,11 @@ def test_compiler_classifies_autogen_typed_messages() -> None:
     )
 
     assert _semantic_blocks(result, SemanticType.ROLE_IDENTITY)[0].movability == Movability.LOCAL_ONLY
+    assert _semantic_blocks(result, SemanticType.ROLE_IDENTITY)[0].has_hard_risk is True
+    assert "agent_identity_boundary" in _semantic_blocks(result, SemanticType.ROLE_IDENTITY)[0].dependency_refs
+    assert _semantic_blocks(result, SemanticType.ROLE_IDENTITY)[0].summary is not None
     assert _semantic_blocks(result, SemanticType.GLOBAL_TASK_BACKGROUND)[0].movability == Movability.SAFE_PREFIX
+    assert _semantic_blocks(result, SemanticType.GLOBAL_TASK_BACKGROUND)[0].has_hard_risk is False
     assert _semantic_blocks(result, SemanticType.SHARED_CONTEXT)[0].movability == Movability.SAFE_PREFIX
     assert _semantic_blocks(result, SemanticType.SHARED_TOOL_DESCRIPTION)[0].movability == Movability.CONDITIONAL_PREFIX
     assert _semantic_blocks(result, SemanticType.CURRENT_TURN_INSTRUCTION)[0].movability == Movability.ORDER_SENSITIVE
@@ -436,6 +454,14 @@ def test_prefix_reorder_client_emits_prompt_safe_telemetry() -> None:
     assert records[1]["cacheable_prefix_blocks"]
     assert records[1]["prefix_tree"]["root"]["label"] == "global_shared_prefix"
     assert records[1]["utility_estimate"]["estimated_gain_chars"] > 0
+    assert records[1]["utility_preservation"]["is_utility_preserved"] is None
+    assert records[1]["utility_preservation"]["utility_status"] == "not_configured"
+    assert records[1]["utility_status"] == "not_configured"
+    assert records[1]["hard_constraint_passed"] is True
+    assert records[1]["prefix_tree_candidate"]["placements"]
+    assert records[1]["planner_score_breakdown"]["estimated_cache_gain"] > 0
+    assert records[1]["cache_gain_report"]["global_prefix_tokens"] > 0
+    assert records[1]["planner_feedback"]["accepted"] is True
     serialized = json.dumps(records[1], ensure_ascii=False)
     assert "AGENT_NAME: engineer" not in serialized
     assert "Shared project context." not in serialized
@@ -489,6 +515,37 @@ def test_semantic_guard_exception_fails_closed() -> None:
     assert client.last_validation_report is not None
     assert client.last_validation_report.fallback is True
     assert client.last_validation_report.reason == "semantic_guard_failed:exception:RuntimeError"
+
+
+def test_utility_preservation_rejection_forces_fallback_and_feedback() -> None:
+    inner = FakeClient()
+    feedback = PlannerFeedbackLearner()
+    validator = CacheUtilityValidator(utility_validator=RejectingUtilityValidator())
+    client = PrefixReorderClient(
+        inner,
+        session_id="team",
+        validator=validator,
+        feedback_learner=feedback,
+    )
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    second_content = inner.create_calls[1]["messages"][0].content
+    assert second_content.index("ROLE_SPECIFIC_INSTRUCTION_START") < second_content.index("USER_TASK_START")
+    assert client.last_validation_report is not None
+    assert client.last_validation_report.fallback is True
+    assert client.last_validation_report.reason == "utility_preservation_failed:role_output_order_uncertain"
+    assert client.last_validation_report.utility_preservation_report is not None
+    assert client.last_validation_report.utility_preservation_report.confidence == pytest.approx(0.82)
+    assert client.last_telemetry_record is not None
+    assert client.last_telemetry_record["utility_preservation"]["is_utility_preserved"] is False
+    assert client.last_feedback_record is not None
+    assert client.last_feedback_record["accepted"] is False
+    summary = feedback.summarize()
+    assert summary["record_count"] == 2
+    assert summary["fallback_count"] == 1
+    assert summary["validation_reason_counts"]["utility_preservation_failed:role_output_order_uncertain"] == 1
 
 
 def test_prefix_reorder_client_writes_jsonl_telemetry(tmp_path) -> None:
@@ -680,3 +737,87 @@ def test_prefix_reorder_client_is_autogen_chat_completion_client() -> None:
     assert isinstance(client, ChatCompletionClient)
     assert client.model_info["family"] == ModelFamily.UNKNOWN
     assert client.count_tokens(_messages("planner")) == 1
+
+
+def test_planner_generates_prefix_tree_candidates_and_materializes_prompt() -> None:
+    compiler = LocalPromptCompiler()
+    planner = HierarchicalPrefixPlanner()
+    planner.plan(compiler.compile(_messages("planner"), session_id="candidate"), session_id="candidate")
+    result = compiler.compile(_messages("engineer"), session_id="candidate")
+
+    candidates = planner.generate_candidates(result, session_id="candidate")
+
+    assert len(candidates) == 3
+    assert {candidate.generation_reason.split(":", 1)[0] for candidate in candidates} == {
+        "conservative",
+        "balanced",
+        "aggressive",
+    }
+    best = candidates[0]
+    agent_id = next(iter(best.agent_paths))
+    materialized = planner.materialize_prompt(best, agent_id)
+    assert materialized == best.materialized_prompts[agent_id]
+    block_order = best.agent_block_orders[agent_id]
+    assert Counter(block_order) == Counter(block.block_id for block in result.blocks)
+    assert len(block_order) == len(set(block_order))
+    assert all(placement.placement_score_breakdown for placement in best.placements)
+    assert best.planner_score_breakdown["hard_risk_summary"]["shared_hard_risk_count"] == 0
+
+
+def test_feedback_records_candidate_and_placement_level_without_utility_positive() -> None:
+    compiler = LocalPromptCompiler()
+    planner = HierarchicalPrefixPlanner()
+    validator = CacheUtilityValidator()
+    feedback = PlannerFeedbackLearner()
+    planner.plan(compiler.compile(_messages("planner"), session_id="feedback"), session_id="feedback")
+    result = compiler.compile(_messages("engineer"), session_id="feedback")
+    plan = planner.plan(result, session_id="feedback")
+    report = validator.validate(
+        original_messages=result.messages,
+        rewritten_messages=rewrite_messages(result, plan),
+        compile_result=result,
+        plan=plan,
+    )
+
+    record = feedback.record(compile_result=result, plan=plan, validation_report=report)
+
+    assert record.candidate_feedback["utility_status"] == "not_configured"
+    labels = {item["placement_label"] for item in record.placement_feedback}
+    assert "weak_positive" in labels
+    assert "utility_positive" not in labels
+    assert feedback.weak_success_rate_for_placement(**record.placement_outcomes[0]) is not None
+    assert feedback.get_feedback_summary_by_scope()["scope_label_counts"]
+    assert feedback.export_replay_dataset()[0]["candidate_id"] == record.candidate_id
+
+
+def test_replay_record_preserves_candidate_and_reports_without_prompt_text() -> None:
+    compiler = LocalPromptCompiler()
+    planner = HierarchicalPrefixPlanner()
+    validator = CacheUtilityValidator()
+    planner.plan(compiler.compile(_messages("planner"), session_id="replay"), session_id="replay")
+    result = compiler.compile(_messages("engineer"), session_id="replay")
+    plan = planner.plan(result, session_id="replay")
+    report = validator.validate(
+        original_messages=result.messages,
+        rewritten_messages=rewrite_messages(result, plan),
+        compile_result=result,
+        plan=plan,
+    )
+
+    replay = build_replay_run_record(
+        run_id="replay-1",
+        compile_result=result,
+        plan=plan,
+        validation_report=report,
+        candidates=(plan.prefix_tree_candidate,),
+        final_decision="applied",
+        include_text=False,
+    )
+
+    serialized = json.dumps(replay, ensure_ascii=False)
+    assert replay["prefix_tree_candidates"][0]["candidate_id"] == plan.prefix_tree_candidate.candidate_id
+    assert replay["hard_validator_report"]["passed"] is True
+    assert replay["utility_validator_report"]["utility_status"] == "not_configured"
+    assert replay["cache_gain_report"]["estimated_cache_gain"] > 0
+    assert "AGENT_NAME: engineer" not in serialized
+    assert "Shared project context." not in serialized

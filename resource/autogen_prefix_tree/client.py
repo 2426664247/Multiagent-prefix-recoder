@@ -17,11 +17,13 @@ from autogen_core.tools import Tool, ToolSchema
 from pydantic import BaseModel
 from typing_extensions import Self
 
+from .cache_estimator import cache_estimator_config_name, observe_cache_estimator
 from .compiler import LocalPromptCompiler
+from .feedback import JsonlFeedbackLogger, PlannerFeedbackLearner
 from .ir import CompileResult, PromptBlock
 from .planner import HierarchicalPrefixPlanner, PrefixPlan, rewrite_messages
 from .semantic_guard import OpenAICompatibleSemanticGuard
-from .telemetry import JsonlTelemetryLogger, TelemetrySink, dataclass_to_dict, serialize_prefix_tree
+from .telemetry import JsonlTelemetryLogger, TelemetrySink, dataclass_to_dict, serialize_prefix_tree, serialize_prefix_tree_candidate
 from .validator import CacheUtilityValidator, ValidationReport
 
 
@@ -42,7 +44,9 @@ class PrefixReorderClientConfig(BaseModel):
     enable_natural_language_segmentation: bool = False
     enable_groupchat_history_reordering: bool = False
     telemetry_log_path: str | None = None
+    feedback_log_path: str | None = None
     min_estimated_gain_chars: int = 1
+    cache_estimator: str = "prefix_tree"
     semantic_guard: SemanticGuardConfig | None = None
 
 
@@ -65,22 +69,36 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
         enable_groupchat_history_reordering: bool = False,
         telemetry_sink: TelemetrySink | None = None,
         telemetry_log_path: str | Path | None = None,
+        feedback_learner: PlannerFeedbackLearner | None = None,
+        feedback_log_path: str | Path | None = None,
+        cache_estimator: str | Any | None = None,
     ) -> None:
         self.inner_client = inner_client
         self.enable_natural_language_segmentation = enable_natural_language_segmentation
         self.enable_groupchat_history_reordering = enable_groupchat_history_reordering
+        self.feedback_learner = feedback_learner or PlannerFeedbackLearner(
+            feedback_sink=JsonlFeedbackLogger(feedback_log_path) if feedback_log_path is not None else None
+        )
         self.compiler = compiler or LocalPromptCompiler(
             enable_natural_language_segmentation=enable_natural_language_segmentation,
             enable_groupchat_history_reordering=enable_groupchat_history_reordering,
         )
         self.planner = planner or HierarchicalPrefixPlanner(
-            enable_groupchat_history_reordering=enable_groupchat_history_reordering
+            enable_groupchat_history_reordering=enable_groupchat_history_reordering,
+            feedback_policy=self.feedback_learner,
         )
-        self.validator = validator or CacheUtilityValidator()
+        if hasattr(self.planner, "feedback_policy") and getattr(self.planner, "feedback_policy") is None:
+            self.planner.feedback_policy = self.feedback_learner
+        if validator is None:
+            self.validator = CacheUtilityValidator(cache_estimator=cache_estimator)
+        else:
+            self.validator = validator
         self.session_id = session_id
         self.enabled = enabled
+        self.cache_estimator_config = cache_estimator_config_name(cache_estimator if validator is None else self.validator.cache_estimator)
         self.last_plan: PrefixPlan | None = None
         self.last_validation_report: ValidationReport | None = None
+        self.last_feedback_record: dict[str, Any] | None = None
         self.last_telemetry_record: dict[str, Any] | None = None
         self.last_telemetry_error: str | None = None
         self._request_index = 0
@@ -98,7 +116,9 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             enable_natural_language_segmentation=self.enable_natural_language_segmentation,
             enable_groupchat_history_reordering=self.enable_groupchat_history_reordering,
             telemetry_log_path=self._telemetry_log_path(),
+            feedback_log_path=self._feedback_log_path(),
             min_estimated_gain_chars=self.validator.min_estimated_gain_chars,
+            cache_estimator=self.cache_estimator_config,
         )
 
     @classmethod
@@ -110,12 +130,14 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             validator=CacheUtilityValidator(
                 min_estimated_gain_chars=config.min_estimated_gain_chars,
                 semantic_guard=semantic_guard,
+                cache_estimator=config.cache_estimator,
             ),
             session_id=config.session_id,
             enabled=config.enabled,
             enable_natural_language_segmentation=config.enable_natural_language_segmentation,
             enable_groupchat_history_reordering=config.enable_groupchat_history_reordering,
             telemetry_log_path=config.telemetry_log_path,
+            feedback_log_path=config.feedback_log_path,
         )
 
     async def create(
@@ -228,6 +250,14 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             )
             self.last_validation_report = report
             prepared_messages = messages if report.fallback else rewritten_messages
+            self._observe_cache_estimator(
+                compile_result=compile_result,
+                plan=plan,
+                original_messages=messages,
+                rewritten_messages=rewritten_messages,
+                accepted=not report.fallback,
+            )
+            self._record_feedback(compile_result=compile_result, plan=plan, report=report)
             self._emit_telemetry(
                 self._build_telemetry_record(
                     request_index=request_index,
@@ -261,6 +291,30 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
     def _next_request_index(self) -> int:
         self._request_index += 1
         return self._request_index
+
+    def _record_feedback(
+        self,
+        *,
+        compile_result: CompileResult | None,
+        plan: PrefixPlan | None,
+        report: ValidationReport,
+    ) -> None:
+        if compile_result is None or plan is None:
+            self.last_feedback_record = None
+            return
+        try:
+            record = self.feedback_learner.record(
+                compile_result=compile_result,
+                plan=plan,
+                validation_report=report,
+            )
+            self.last_feedback_record = record.to_dict()
+        except Exception as exc:  # noqa: BLE001
+            self.last_feedback_record = {
+                "schema_version": "prefix-planner-feedback-error-v1",
+                "prompt_safe_summary": True,
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
 
     def _emit_telemetry(self, record: dict[str, Any]) -> None:
         self.last_telemetry_record = record
@@ -304,13 +358,27 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             "moved_block_details": moved_details,
             "cacheable_prefix_blocks": plan.cacheable_prefix_blocks if plan else (),
             "prefix_tree": serialize_prefix_tree(plan.prefix_tree if plan else None),
+            "prefix_tree_candidate": serialize_prefix_tree_candidate(
+                plan.prefix_tree_candidate if plan else None,
+                include_text=False,
+            ),
+            "planner_score": plan.planner_score if plan else None,
+            "planner_score_breakdown": plan.planner_score_breakdown if plan else None,
+            "cache_gain_report": plan.cache_gain_report if plan else None,
             "validation": {
                 "applied": report.applied,
                 "fallback": report.fallback,
                 "reason": report.reason,
             },
+            "hard_constraint_passed": report.hard_constraint_passed,
+            "hard_constraint_report": report.hard_constraint_report,
+            "utility_status": report.utility_status,
+            "cache_hit_increased": report.cache_hit_increased,
+            "cache_estimate_report": dataclass_to_dict(report.cache_estimate_report),
             "utility_estimate": dataclass_to_dict(report.utility_estimate),
+            "utility_preservation": dataclass_to_dict(report.utility_preservation_report),
             "semantic_guard": dataclass_to_dict(report.semantic_guard_report),
+            "planner_feedback": self.last_feedback_record,
             "risk_notes": report.risk_notes,
             "hashes": {
                 "tools": compile_result.tools_hash if compile_result else None,
@@ -336,9 +404,38 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
     def _message_type(self, message: LLMMessage) -> str:
         return getattr(message, "type", type(message).__name__)
 
+    def _observe_cache_estimator(
+        self,
+        *,
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        accepted: bool,
+    ) -> None:
+        observe_cache_estimator(
+            self.validator.cache_estimator,
+            original_messages,
+            rewritten_messages,
+            accepted=accepted,
+            candidate=plan.prefix_tree_candidate,
+            context={
+                "compile_result": compile_result,
+                "plan": plan,
+                "session_id": compile_result.session_id,
+                "candidate": plan.prefix_tree_candidate,
+            },
+        )
+
     def _telemetry_log_path(self) -> str | None:
         for sink in self._telemetry_sinks:
             if isinstance(sink, JsonlTelemetryLogger):
+                return str(sink.path)
+        return None
+
+    def _feedback_log_path(self) -> str | None:
+        for sink in self.feedback_learner._sinks:
+            if isinstance(sink, JsonlFeedbackLogger):
                 return str(sink.path)
         return None
 

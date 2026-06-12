@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Utility Label",
+  "type": "object",
+  "required": [
+    "label_id",
+    "task_id",
+    "candidate_id",
+    "dataset_source",
+    "scenario_type",
+    "candidate_strategy",
+    "original_run_status",
+    "reordered_run_status",
+    "is_utility_preserved",
+    "label_source",
+    "failure_type",
+    "hard_constraint_passed",
+    "utility_status",
+    "cache_gain_report",
+    "placement_changes",
+    "prompt_text_included",
+    "created_at"
+  ],
+  "properties": {
+    "label_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "candidate_id": {"type": "string"},
+    "dataset_source": {"type": "string"},
+    "scenario_type": {"type": "string"},
+    "candidate_strategy": {"type": "string"},
+    "original_run_status": {"type": "string", "enum": ["passed", "failed", "skipped", "error"]},
+    "reordered_run_status": {"type": "string", "enum": ["passed", "failed", "skipped", "error"]},
+    "is_utility_preserved": {"type": ["boolean", "null"]},
+    "label_source": {
+      "type": "string",
+      "enum": [
+        "execution_oracle",
+        "schema_oracle",
+        "tool_trace_oracle",
+        "state_oracle",
+        "privacy_oracle",
+        "dsapi_execution_oracle",
+        "fake_smoke_oracle"
+      ]
+    },
+    "failure_type": {
+      "type": "string",
+      "enum": [
+        "none",
+        "code_test_fail",
+        "json_schema_fail",
+        "wrong_tool_call",
+        "private_info_leak",
+        "role_confusion",
+        "format_violation",
+        "state_mismatch",
+        "original_failed",
+        "runtime_error"
+      ]
+    },
+    "hard_constraint_passed": {"type": "boolean"},
+    "utility_status": {"type": "string"},
+    "cache_gain_report": {"type": ["object", "null"]},
+    "placement_changes": {"type": "array"},
+    "prompt_text_included": {"type": "boolean"},
+    "api_model": {"type": ["string", "null"]},
+    "api_cost_estimate": {"type": ["object", "null"]},
+    "created_at": {"type": "string"}
+  },
+  "additionalProperties": true
+}

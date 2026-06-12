@@ -21,9 +21,13 @@ LocalPromptCompiler -> HierarchicalPrefixPlanner -> CacheUtilityValidator
 - 只支持 exact hash sharing。
 - 不确定时原样回退到 inner client。
 
+## 当前阶段
+
+当前阶段是 Utility Validator 训练前的框架搭建：实现 prefix tree planner、placement-level feedback、hard validator、cache gain report、replay log 和 HumanEval utility goldset builder。此阶段不训练 Utility Validator，也不训练 Planner/ranking 模型；所有 planner scoring 都是规则式、可解释、可替换的接口。
+
 ## 当前新增能力
 
-Planner 现在不只返回线性 `new_order`，还会生成一棵显式 prefix tree：
+Planner 现在的主语义输出是 `PrefixTreeCandidate`。为兼容旧 wrapper，`plan()` 仍返回 `PrefixPlan`，但其中会挂载 `prefix_tree_candidate`、`placements`、`planner_score_breakdown` 和 `cache_gain_report`。
 
 ```text
 root: global_shared_prefix
@@ -31,7 +35,15 @@ root: global_shared_prefix
     -> leaf: agent_local_suffix
 ```
 
-第一版仍然只把已经在同一 session 中出现过、且被 compiler 标为 `safe_prefix` / `conditional_prefix` 的共享 system text block 放入共享前缀。没有历史复用证据时只 observe，不重排。
+`PrefixTreeCandidate` 表达：
+
+- global shared prefix、subgroup shared prefix、agent-local suffix；
+- 每个 agent 从 root 到 leaf 的 `agent_paths`；
+- 每个 block 的 `BlockPlacement`、target scope、风险和 placement score；
+- `estimated_cache_gain`、`planner_score` 和 breakdown；
+- 可回放的 block order 与 materialized prompt hash/text（telemetry 默认不写正文）。
+
+`generate_candidates(...)` 会生成 conservative、balanced、aggressive 三类候选。当前仍只把已经在同一 session 中出现过、且通过 hard-gate 规则的 exact-hash shared block 放入共享前缀；没有历史复用证据时只 observe，不重排。`materialize_prompt(candidate, agent_id)` 会按 prefix tree 路径展开指定 agent 的最终 prompt，并检查不丢 block、不篡改、不重复。
 
 Validator 现在会额外检查：
 
@@ -41,6 +53,45 @@ Validator 现在会额外检查：
 - 是否有最小 cache utility 增益估计。
 
 `ValidationReport.utility_estimate` 会给出轻量指标，包括原始/重写后可复用前缀字符数、移动 block 字符数、估计增益和前后 block 指纹。后续接真实 API 时，可以把这些字段和 provider 返回的 cached tokens、latency、cost 一起记录。
+
+Cache gain 现在优先来自 prefix tree / shared prefix：report 会记录 longest common prefix tokens、global prefix tokens、subgroup prefix tokens、每个 prefix tree node 的 cache contribution 和 candidate 总 `estimated_cache_gain`。
+
+## Unified CacheEstimator
+
+The Cache Hit Increased Gate now reads a unified `CacheEstimator` interface:
+
+```python
+from autogen_prefix_tree import CacheHitProxyEstimator, CacheUtilityValidator, PrefixReorderClient
+
+validator = CacheUtilityValidator(cache_estimator="cache_hit_proxy")
+model_client = PrefixReorderClient(inner_client, cache_estimator="cache_hit_proxy")
+
+validator = CacheUtilityValidator(cache_estimator=CacheHitProxyEstimator())
+```
+
+Supported estimators:
+
+- `PrefixTreeEstimator` is the default and preserves the existing offline prefix-tree/shared-prefix behavior.
+- `CacheHitProxyEstimator` dynamically loads `cache_hit_proxy/cache_estimator.py` through an adapter, does not modify `cache_hit_proxy/`, and uses prompt-safe hash-derived token units instead of recording prompt text.
+- `ProviderTelemetryEstimator` is a placeholder for future provider-reported cached tokens, latency, and cost.
+
+If `cache_hit_proxy` is configured but unavailable or its interface does not match, the adapter fails gracefully and falls back to `PrefixTreeEstimator`; the report sets `used_fallback=true` and records the reason. Offline estimates are not real provider cached-token measurements. Real cached tokens, latency, and cost still require future provider telemetry.
+
+`ValidationReport`, request telemetry, replay records, feedback records, and goldset/training feature exports now include `cache_estimate_report` with `estimator_name`, `estimator_available`, `used_fallback`, `cached_tokens_delta`, `estimated_cache_gain`, contribution fields, reason, and warnings. The older `cache_gain_report` remains available for compatibility.
+
+No-network smoke:
+
+```powershell
+$env:PYTHONPATH = "resource"
+.venv\Scripts\python.exe -m autogen_prefix_tree.cache_estimator_smoke `
+  --estimator prefix-tree `
+  --output-dir tmp\cache_estimator_smoke
+
+$env:PYTHONPATH = "resource"
+.venv\Scripts\python.exe -m autogen_prefix_tree.cache_estimator_smoke `
+  --estimator cache-hit-proxy `
+  --output-dir tmp\cache_estimator_smoke_proxy
+```
 
 ## Semantic Guard
 
@@ -102,6 +153,126 @@ model_config:
 - guard 抛异常时也回退，reason 形如 `semantic_guard_failed:exception:RuntimeError`。
 - 本地模型置信度低于 `min_confidence` 时也回退，reason 为 `semantic_guard_failed:local_judge_low_confidence`。
 - telemetry 会记录 guard report，但不记录 prompt 正文。
+
+## Feedback-Driven Planner Update
+
+当前主链路已经从单纯的固定语义分类规则，推进为更明确的反馈驱动结构：
+
+```text
+LocalPromptCompiler -> HierarchicalPrefixPlanner
+  -> CacheUtilityValidator
+     -> Hard Constraint Gate
+     -> Utility Preservation Gate
+     -> Cache Hit Increased Gate
+  -> PlannerFeedbackLearner
+```
+
+固定 `semantic_type` 仍然保留为解释性 metadata 和保守 fallback hint，但 planner 的长期优化入口已经转向 prompt-safe feedback。`PromptBlock` 现在会额外保留：
+
+- `has_hard_risk`：是否命中不可交给 utility 事后判断的硬风险；
+- `dependency_refs`：顺序、角色边界、工具结果、私有记忆等依赖提示；
+- `summary`：不含 prompt 正文的简短 block 元信息。
+
+Validator 分层如下：
+
+```text
+Hard Constraint Gate
+  -> Utility Preservation Gate
+  -> Cache Hit Increased Gate
+  -> Accept / Rollback
+```
+
+第一层仍然 fail closed，检查 block 不丢失/不篡改、tools/tool choice/model args 不变、不可移动块不移动、prefix tree 覆盖完整、重写消息与 plan 严格匹配等硬约束。只有通过硬约束的 candidate 才进入 utility gate。
+
+`UtilityPreservationReport` 已作为接口落地：
+
+```json
+{
+  "is_utility_preserved": null,
+  "confidence": 0.0,
+  "reason": "utility_validator_not_configured",
+  "checks": ["hard_constraints_passed", "interface_reserved"],
+  "utility_status": "not_configured"
+}
+```
+
+当前默认不训练、不调用 utility 小模型；未配置 `utility_validator` 时，utility gate 只记录 `not_configured`，不会把 utility preserved 记成 true。当前 `accepted` 只表示 hard constraint passed + cache gain increased，不表示 utility success。如果注入的本地 utility validator 返回 `is_utility_preserved=false`，validator 会直接回滚，reason 形如：
+
+```text
+utility_preservation_failed:<reason>
+```
+
+只有 utility preserved 且离线估计的 cacheable prefix 字符数增加时，重排才会被接受；否则回滚。
+
+`PlannerFeedbackLearner` 会记录 candidate-level 与 placement-level feedback。Candidate feedback 包括 run/candidate/scenario、accepted/applied/fallback、hard constraint、utility status、cache gain 和 validator report；placement feedback 包括 placement_id、block hash、原/目标 scope、目标 agent group、risk/dependency、cache contribution、hard/cache/utility result 和 `placement_label`。
+
+当前未训练 Utility Validator 时，accepted placement 最多标记为 `weak_positive`，不会产生 `utility_positive`。查询接口包括 `success_rate_for_placement(...)`、`weak_success_rate_for_placement(...)`、`rejection_rate_for_placement(...)`、`get_historical_score_for_placement(...)`、`get_feedback_summary_by_scope(...)`、`export_replay_dataset(...)`。它当前只做记录和汇总，不训练模型，也不自动改变 validator 行为。可以在 AutoGen wrapper 中写 JSONL：
+
+```python
+from autogen_prefix_tree import PrefixReorderClient
+
+model_client = PrefixReorderClient(
+    inner_client,
+    telemetry_log_path="runs/prefix_reorder_telemetry.jsonl",
+    feedback_log_path="runs/planner_feedback.jsonl",
+)
+```
+
+OpenAI-compatible adapter 也会在 telemetry 中写入 `utility_preservation` 与 `planner_feedback` 字段。
+
+### HumanEval Utility Annotation Template
+
+本次还新增了 HumanEval 本地人工标注样例框架，用来为后续 `LocalUtilityValidator` 训练或评估准备数据。默认输出 prompt-safe metadata，不写原始 prompt 正文：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.utility_goldset_builder `
+  --input datasets\HumanEval\Tasks\human_eval_TwoAgents.jsonl `
+  --input datasets\HumanEval\Tasks\human_eval_GroupChatThreeAgents_sample2.jsonl `
+  --output experiments\humaneval-utility-goldset\utility_goldset_template.jsonl `
+  --summary experiments\humaneval-utility-goldset\summary.json `
+  --max-rows 8
+```
+
+如果需要人工本地标注时查看原始 / 重排 block 文本，可以显式加 `--include-text`，并把输出文件保留在本地实验目录，不提交：
+
+```powershell
+.venv\Scripts\python.exe -m autogen_prefix_tree.utility_goldset_builder `
+  --input datasets\HumanEval\Tasks\human_eval_TwoAgents.jsonl `
+  --output experiments\humaneval-utility-goldset\utility_goldset_template.local.jsonl `
+  --summary experiments\humaneval-utility-goldset\summary.local.json `
+  --max-rows 8 `
+  --include-text
+```
+
+模板行会包含：
+
+- original / reordered block metadata；
+- `prefix_tree_candidate`；
+- `materialized_reordered_prompts`（默认只写 hash，`--include-text` 时写本地正文）；
+- `placement_changes`；
+- `hard_constraint_report`；
+- `estimated_cache_gain`；
+- moved block summary；
+- hard constraint 是否通过；
+- `expected_is_utility_preserved` 人工标注占位；
+- `annotator_reason`、`oracle_result` 和 `label_status=unlabeled`；
+- annotation focus；
+- cache hit increased 离线估计。
+
+这些样例只面向“已经通过硬约束但可能影响任务效果”的合法重排，不用于训练硬约束违规检测。
+
+## Replay Log
+
+`autogen_prefix_tree.replay` 提供可回放数据工具：
+
+- `build_replay_run_record(...)` / `ReplayRunStore.save_replay_run(...)`
+- `load_replay_run(run_id_or_path)`
+- `replay_candidate(candidate_id, ...)`
+- `revalidate_candidate(candidate_id, validator, ...)`
+- `export_utility_labeling_samples(...)`
+- `export_planner_training_samples(...)`
+
+Replay 记录会保存 original prompt hashes、compiler blocks、block metadata、所有 `PrefixTreeCandidate`、materialized prompts（默认 hash）、block placements、planner score breakdown、hard validator report、utility validator report、cache gain report、final decision、fallback reason 和 feedback records。默认不保存 prompt 正文；只有本地实验显式 `include_text=True` 时才写正文。
 
 `enable_natural_language_segmentation` 是实验开关，默认关闭。开启后只对未标注的自然语言 system prompt 做保守行级切块，用于 `baseline / rule-only / nl-segmentation` A/B；正式结论仍必须由真实 provider 与任务结果验证。
 

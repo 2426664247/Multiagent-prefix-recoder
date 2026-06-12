@@ -78,8 +78,10 @@ class LocalPromptCompiler:
         source_type = getattr(message, "type", type(message).__name__)
         source_role = self._source_role(message)
         agent_or_source = getattr(message, "source", None)
-        source_message_id = f"msg:{message_index}:{source_type}:{agent_or_source or ''}"
         content = getattr(message, "content", None)
+        if isinstance(message, SystemMessage) and isinstance(content, str):
+            agent_or_source = agent_or_source or _extract_agent_name(content)
+        source_message_id = f"msg:{message_index}:{source_type}:{agent_or_source or ''}"
 
         if isinstance(message, SystemMessage) and isinstance(content, str):
             segments = (
@@ -175,6 +177,31 @@ class LocalPromptCompiler:
             original_position=BlockPosition(message_index=message_index, part_index=part_index),
             rendered_text=text,
             is_system_text=is_system_text,
+            has_hard_risk=_has_hard_risk(movability, risk_tags),
+            dependency_refs=_dependency_refs(risk_tags),
+            summary=_block_summary(
+                source_role=source_role,
+                source_type=source_type,
+                semantic_type=semantic_type,
+                movability=movability,
+                share_scope=share_scope,
+                risk_tags=risk_tags,
+                char_count=len(text),
+            ),
+            token_len=_estimate_token_len(text),
+            candidate_shared_agents=_candidate_shared_agents(agent_or_source, share_scope),
+            dependency_before=_dependency_refs(risk_tags),
+            dependency_after=(),
+            movable_hint=movability.value,
+            contains_private_info=semantic_type == SemanticType.PRIVATE_MEMORY or "credential" in risk_tags,
+            contains_role_identity=semantic_type == SemanticType.ROLE_IDENTITY or "agent_identity" in risk_tags,
+            contains_tool_permission=semantic_type == SemanticType.PRIVATE_TOOL_PERMISSION
+            or "private_tool_permission" in risk_tags,
+            contains_latest_user_instruction=semantic_type
+            in {SemanticType.CURRENT_USER_INSTRUCTION, SemanticType.CURRENT_TURN_INSTRUCTION}
+            or bool({"latest_user_instruction", "current_turn_instruction"} & set(risk_tags)),
+            contains_tool_result=semantic_type == SemanticType.TOOL_RESULT or "tool_result_order" in risk_tags,
+            contains_credential="credential" in risk_tags or _contains_credential_value(text),
         )
 
     def _make_payload_block(
@@ -245,6 +272,31 @@ class LocalPromptCompiler:
             original_position=BlockPosition(message_index=message_index, part_index=0),
             rendered_text=None,
             is_system_text=False,
+            has_hard_risk=_has_hard_risk(movability, risk_tags),
+            dependency_refs=_dependency_refs(risk_tags),
+            summary=_block_summary(
+                source_role=source_role,
+                source_type=source_type,
+                semantic_type=semantic_type,
+                movability=movability,
+                share_scope=share_scope,
+                risk_tags=risk_tags,
+                char_count=0,
+            ),
+            token_len=_estimate_token_len(stable_hash(payload)),
+            candidate_shared_agents=_candidate_shared_agents(agent_or_source, share_scope),
+            dependency_before=_dependency_refs(risk_tags),
+            dependency_after=(),
+            movable_hint=movability.value,
+            contains_private_info=semantic_type == SemanticType.PRIVATE_MEMORY or "credential" in risk_tags,
+            contains_role_identity=semantic_type == SemanticType.ROLE_IDENTITY or "agent_identity" in risk_tags,
+            contains_tool_permission=semantic_type == SemanticType.PRIVATE_TOOL_PERMISSION
+            or "private_tool_permission" in risk_tags,
+            contains_latest_user_instruction=semantic_type
+            in {SemanticType.CURRENT_USER_INSTRUCTION, SemanticType.CURRENT_TURN_INSTRUCTION}
+            or bool({"latest_user_instruction", "current_turn_instruction"} & set(risk_tags)),
+            contains_tool_result=semantic_type == SemanticType.TOOL_RESULT or "tool_result_order" in risk_tags,
+            contains_credential="credential" in risk_tags,
         )
 
     def _classify_text(
@@ -258,6 +310,9 @@ class LocalPromptCompiler:
         is_system_text: bool,
     ) -> tuple[SemanticType, Movability, ShareScope, tuple[str, ...]]:
         upper = text.upper()
+
+        if _contains_credential_value(text):
+            return SemanticType.PRIVATE_MEMORY, Movability.LOCAL_ONLY, ShareScope.PRIVATE, ("credential",)
 
         if source_role == "assistant":
             return (
@@ -383,6 +438,13 @@ def _first_section_marker(upper_text: str) -> str | None:
     return match.group(1)
 
 
+def _extract_agent_name(text: str) -> str | None:
+    match = re.search(r"^\s*AGENT_NAME\s*:\s*([A-Za-z0-9_.:-]+)\s*$", text, flags=re.MULTILINE)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _has_explicit_section_markers(text: str) -> bool:
     return _first_section_marker(text.upper()) is not None
 
@@ -470,3 +532,85 @@ def _is_agent_history_source(source: str | None) -> bool:
     if not normalized:
         return False
     return normalized not in {"user", "human", "system"}
+
+
+def _has_hard_risk(movability: Movability, risk_tags: tuple[str, ...]) -> bool:
+    if movability in {Movability.LOCAL_ONLY, Movability.ORDER_SENSITIVE, Movability.NEVER_MOVE}:
+        return True
+    hard_tags = {
+        "agent_identity",
+        "current_turn_instruction",
+        "latest_user_instruction",
+        "private_memory",
+        "private_tool_permission",
+        "tool_result_order",
+        "unknown_payload",
+        "unknown_system_text",
+        "unknown_text",
+        "credential",
+    }
+    return bool(set(risk_tags) & hard_tags)
+
+
+def _dependency_refs(risk_tags: tuple[str, ...]) -> tuple[str, ...]:
+    dependencies: list[str] = []
+    if any(tag in risk_tags for tag in ("current_turn_instruction", "latest_user_instruction")):
+        dependencies.append("latest_user_instruction_order")
+    if any(tag in risk_tags for tag in ("assistant_history_order", "user_message_history_order")):
+        dependencies.append("conversation_history_order")
+    if "groupchat_dialogue_order" in risk_tags:
+        dependencies.append("initial_task_before_groupchat_history")
+    if "tool_result_order" in risk_tags:
+        dependencies.append("tool_call_result_order")
+    if "agent_identity" in risk_tags:
+        dependencies.append("agent_identity_boundary")
+    if "private_memory" in risk_tags:
+        dependencies.append("private_memory_boundary")
+    if "private_tool_permission" in risk_tags:
+        dependencies.append("private_tool_permission_boundary")
+    if "credential" in risk_tags:
+        dependencies.append("credential_boundary")
+    return tuple(dependencies)
+
+
+def _candidate_shared_agents(agent_or_source: str | None, share_scope: ShareScope) -> tuple[str, ...]:
+    if share_scope in {ShareScope.GLOBAL, ShareScope.SUBGROUP, ShareScope.AGENT} and agent_or_source:
+        return (str(agent_or_source),)
+    return ()
+
+
+def _estimate_token_len(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    word_like = len(re.findall(r"\w+|[^\w\s]", stripped, flags=re.UNICODE))
+    char_proxy = max(1, len(stripped) // 4)
+    return max(1, min(len(stripped), max(word_like, char_proxy)))
+
+
+def _contains_credential_value(text: str) -> bool:
+    patterns = (
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        r"\b(?:api[_-]?key|secret|password|credential)\s*[:=]\s*\S+",
+        r"\bauthorization\s*:\s*bearer\s+\S+",
+        r"\bsk-[A-Za-z0-9_-]{12,}",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _block_summary(
+    *,
+    source_role: str,
+    source_type: str,
+    semantic_type: SemanticType,
+    movability: Movability,
+    share_scope: ShareScope,
+    risk_tags: tuple[str, ...],
+    char_count: int,
+) -> str:
+    risk_label = ",".join(risk_tags[:3]) if risk_tags else "none"
+    return (
+        f"{source_role}/{source_type} block; semantic_hint={semantic_type.value}; "
+        f"movability={movability.value}; share_scope={share_scope.value}; "
+        f"chars={char_count}; risk_tags={risk_label}"
+    )

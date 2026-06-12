@@ -39,6 +39,12 @@ class ShareScope(str, Enum):
     UNKNOWN = "unknown"
 
 
+class PrefixScope(str, Enum):
+    GLOBAL = "global"
+    SUBGROUP = "subgroup"
+    AGENT_LOCAL = "agent_local"
+
+
 @dataclass(frozen=True)
 class BlockPosition:
     message_index: int
@@ -61,6 +67,42 @@ class PromptBlock:
     original_position: BlockPosition
     rendered_text: str | None = None
     is_system_text: bool = False
+    has_hard_risk: bool = False
+    dependency_refs: tuple[str, ...] = ()
+    summary: str | None = None
+    token_len: int = 0
+    candidate_shared_agents: tuple[str, ...] = ()
+    dependency_before: tuple[str, ...] = ()
+    dependency_after: tuple[str, ...] = ()
+    movable_hint: str | None = None
+    contains_private_info: bool = False
+    contains_role_identity: bool = False
+    contains_tool_permission: bool = False
+    contains_latest_user_instruction: bool = False
+    contains_tool_result: bool = False
+    contains_credential: bool = False
+
+    @property
+    def block_hash(self) -> str:
+        return self.content_hash
+
+    @property
+    def raw_text(self) -> str | None:
+        return self.rendered_text
+
+    @property
+    def secure_text_ref(self) -> str | None:
+        if self.rendered_text is not None:
+            return None
+        return f"payload:{self.content_hash[:16]}"
+
+    @property
+    def original_agent_id(self) -> str | None:
+        return self.agent_or_source
+
+    @property
+    def original_message_id(self) -> str:
+        return self.source_message_id
 
 
 @dataclass(frozen=True)
@@ -70,6 +112,13 @@ class PrefixTreeNode:
     label: str
     block_ids: tuple[str, ...] = ()
     children: tuple["PrefixTreeNode", ...] = ()
+    scope_type: PrefixScope | str | None = None
+    agent_ids: tuple[str, ...] = ()
+    parent_id: str | None = None
+    children_ids: tuple[str, ...] = ()
+    token_len: int = 0
+    risk_tags: tuple[str, ...] = ()
+    explanation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +126,43 @@ class PrefixTree:
     session_id: str
     root: PrefixTreeNode
     leaf_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BlockPlacement:
+    placement_id: str
+    block_id: str
+    block_hash: str
+    original_agent_id: str
+    original_position: BlockPosition
+    original_scope: ShareScope | str
+    target_scope: PrefixScope | str
+    target_node_id: str
+    target_agent_group: tuple[str, ...]
+    moved: bool
+    risk_tags: tuple[str, ...] = ()
+    dependency_notes: tuple[str, ...] = ()
+    cache_contribution: float = 0.0
+    placement_score: float = 0.0
+    placement_score_breakdown: Mapping[str, float] | None = None
+
+
+@dataclass(frozen=True)
+class PrefixTreeCandidate:
+    candidate_id: str
+    root_node_id: str
+    nodes: Mapping[str, PrefixTreeNode]
+    agent_paths: Mapping[str, tuple[str, ...]]
+    placements: tuple[BlockPlacement, ...]
+    estimated_cache_gain: float = 0.0
+    planner_score: float = 0.0
+    planner_score_breakdown: Mapping[str, Any] | None = None
+    generation_reason: str = ""
+    agent_block_orders: Mapping[str, tuple[str, ...]] | None = None
+    materialized_prompts: Mapping[str, str] | None = None
+    block_hash_by_id: Mapping[str, str] | None = None
+    block_text_by_id: Mapping[str, str] | None = None
+    cache_gain_report: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

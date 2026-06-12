@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Planner Candidate",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "root_node_id",
+    "nodes",
+    "agent_paths",
+    "placements",
+    "estimated_cache_gain",
+    "planner_score",
+    "generation_reason"
+  ],
+  "properties": {
+    "candidate_id": {"type": "string"},
+    "root_node_id": {"type": "string"},
+    "nodes": {"type": "object"},
+    "agent_paths": {"type": "object"},
+    "placements": {"type": "array"},
+    "estimated_cache_gain": {"type": "number"},
+    "planner_score": {"type": "number"},
+    "planner_score_breakdown": {"type": ["object", "null"]},
+    "generation_reason": {"type": "string"},
+    "agent_block_orders": {"type": "object"},
+    "block_hash_by_id": {"type": "object"},
+    "cache_gain_report": {"type": ["object", "null"]}
+  },
+  "additionalProperties": true
+}

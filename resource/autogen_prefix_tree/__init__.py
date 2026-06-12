@@ -1,30 +1,72 @@
 from .client import PrefixReorderClient
+from .cache_estimator import (
+    CacheEstimateReport,
+    CacheEstimator,
+    CacheHitProxyEstimator,
+    PrefixTreeEstimator,
+    ProviderTelemetryEstimator,
+    resolve_cache_estimator,
+)
 from .compiler import LocalPromptCompiler
+from .feedback import (
+    JsonlFeedbackLogger,
+    PlannerFeedbackLearner,
+    PlannerFeedbackRecord,
+    load_jsonl_feedback,
+    summarize_feedback_records,
+)
 from .ir import (
+    BlockPlacement,
     BlockPosition,
     CompileResult,
     Movability,
+    PrefixScope,
     PrefixTree,
+    PrefixTreeCandidate,
     PrefixTreeNode,
     PromptBlock,
     SemanticType,
     ShareScope,
 )
 from .planner import HierarchicalPrefixPlanner, PrefixPlan, rewrite_messages
+from .replay import (
+    ReplayRunStore,
+    build_replay_run_record,
+    export_planner_training_samples,
+    export_utility_labeling_samples,
+    load_replay_run,
+    replay_candidate,
+    revalidate_candidate,
+)
 from .request_capture import JsonlRequestLogger, RequestCaptureClient
 from .semantic_guard import OpenAICompatibleSemanticGuard, OpenAICompatibleSemanticGuardConfig, SemanticGuard, SemanticGuardReport
 from .static_client import StaticResponseClient
 from .telemetry import JsonlTelemetryLogger, TelemetrySink, TelemetrySummary, load_jsonl_telemetry, summarize_telemetry
-from .validator import CacheUtilityEstimate, CacheUtilityValidator, ValidationReport
+from .utility_oracles import (
+    JsonSchemaOracle,
+    OracleResult,
+    PrivacyLeakOracle,
+    RoleBoundaryOracle,
+    StateConsistencyOracle,
+    ToolTraceOracle,
+    UnitTestOracle,
+)
+from .validator import CacheUtilityEstimate, CacheUtilityValidator, UtilityPreservationReport, ValidationReport
 
 __all__ = [
+    "BlockPlacement",
     "BlockPosition",
     "CacheUtilityEstimate",
     "CacheUtilityValidator",
+    "CacheEstimateReport",
+    "CacheEstimator",
+    "CacheHitProxyEstimator",
     "CompileResult",
     "HierarchicalPrefixPlanner",
     "JsonlRequestLogger",
+    "JsonlFeedbackLogger",
     "JsonlTelemetryLogger",
+    "JsonSchemaOracle",
     "GoldsetCsvResult",
     "LocalPromptCompiler",
     "LocalJudgeHealthcheckResult",
@@ -37,28 +79,55 @@ __all__ = [
     "OpenAIRequestRewriteResult",
     "OpenAICompatibleSemanticGuard",
     "OpenAICompatibleSemanticGuardConfig",
+    "OracleResult",
     "PrefixPlan",
+    "PrefixTreeEstimator",
+    "PrefixScope",
     "PrefixReorderClient",
+    "PrefixTreeCandidate",
+    "PlannerFeedbackLearner",
+    "PlannerFeedbackRecord",
     "RequestCaptureClient",
+    "ReplayRunStore",
     "PrefixTree",
     "PrefixTreeNode",
+    "PrivacyLeakOracle",
+    "ProviderTelemetryEstimator",
     "PromptBlock",
+    "RoleBoundaryOracle",
     "SemanticType",
     "SemanticGuard",
     "SemanticGuardReport",
     "ShareScope",
     "StaticResponseClient",
+    "StateConsistencyOracle",
     "TelemetrySink",
     "TelemetrySummary",
+    "ToolTraceOracle",
+    "UnitTestOracle",
+    "UtilityDatasetBuildResult",
+    "UtilityGoldsetTemplateResult",
+    "UtilityPreservationReport",
     "ValidationReport",
+    "load_jsonl_feedback",
     "load_jsonl_telemetry",
+    "build_humaneval_utility_goldset_template",
+    "build_utility_validator_smoke_dataset",
+    "build_replay_run_record",
     "build_local_judge_goldset_template",
     "export_goldset_template_csv",
     "import_goldset_labeled_csv",
     "run_local_judge_healthcheck",
     "run_local_judge_quality_eval",
     "rewrite_messages",
+    "load_replay_run",
+    "replay_candidate",
+    "revalidate_candidate",
+    "export_utility_labeling_samples",
+    "export_planner_training_samples",
     "rewrite_openai_request_body",
+    "resolve_cache_estimator",
+    "summarize_feedback_records",
     "summarize_telemetry",
     "validate_local_judge_goldset",
     "verify_local_judge_goldset_chain",
@@ -159,6 +228,28 @@ def __getattr__(name: str):
             "GoldsetCsvResult": GoldsetCsvResult,
             "export_goldset_template_csv": export_goldset_template_csv,
             "import_goldset_labeled_csv": import_goldset_labeled_csv,
+        }
+        return values[name]
+    if name in {
+        "UtilityGoldsetTemplateResult",
+        "build_humaneval_utility_goldset_template",
+    }:
+        from .utility_goldset_builder import UtilityGoldsetTemplateResult, build_humaneval_utility_goldset_template
+
+        values = {
+            "UtilityGoldsetTemplateResult": UtilityGoldsetTemplateResult,
+            "build_humaneval_utility_goldset_template": build_humaneval_utility_goldset_template,
+        }
+        return values[name]
+    if name in {
+        "UtilityDatasetBuildResult",
+        "build_utility_validator_smoke_dataset",
+    }:
+        from .utility_dataset_builder import UtilityDatasetBuildResult, build_utility_validator_smoke_dataset
+
+        values = {
+            "UtilityDatasetBuildResult": UtilityDatasetBuildResult,
+            "build_utility_validator_smoke_dataset": build_utility_validator_smoke_dataset,
         }
         return values[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

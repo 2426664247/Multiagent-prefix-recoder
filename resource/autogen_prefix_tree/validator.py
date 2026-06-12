@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from autogen_core.models import LLMMessage
 
+from .cache_estimator import CacheEstimateReport, CacheEstimator, cache_gate_value, resolve_cache_estimator
 from .ir import CompileResult, Movability, PrefixTreeNode, hash_model_args, hash_tools, stable_hash
 from .planner import PrefixPlan
 from .semantic_guard import SemanticGuard, SemanticGuardReport
@@ -20,6 +21,36 @@ class CacheUtilityEstimate:
     estimated_gain_chars: int
     prefix_fingerprint_before: str
     prefix_fingerprint_after: str
+    longest_common_prefix_tokens: int = 0
+    global_prefix_tokens: int = 0
+    subgroup_prefix_tokens: int = 0
+    node_cache_contributions: Mapping[str, Any] | None = None
+    cache_gain_report: Mapping[str, Any] | None = None
+    cache_estimate_report: CacheEstimateReport | None = None
+
+
+@dataclass(frozen=True)
+class UtilityPreservationReport:
+    is_utility_preserved: bool | None
+    confidence: float
+    reason: str
+    checks: tuple[str, ...] = ()
+    model_name: str | None = None
+    prompt_safe: bool = True
+    utility_status: str = "unverified"
+
+
+class UtilityPreservationValidator(Protocol):
+    def evaluate(
+        self,
+        *,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+        cache_utility_estimate: CacheUtilityEstimate,
+    ) -> UtilityPreservationReport:
+        ...
 
 
 @dataclass(frozen=True)
@@ -30,6 +61,12 @@ class ValidationReport:
     utility_estimate: CacheUtilityEstimate | None = None
     semantic_guard_report: SemanticGuardReport | None = None
     risk_notes: tuple[str, ...] = ()
+    utility_preservation_report: UtilityPreservationReport | None = None
+    hard_constraint_passed: bool = False
+    hard_constraint_report: Mapping[str, Any] | None = None
+    utility_status: str = "unverified"
+    cache_hit_increased: bool | None = None
+    cache_estimate_report: CacheEstimateReport | None = None
 
 
 class CacheUtilityValidator:
@@ -40,10 +77,14 @@ class CacheUtilityValidator:
         *,
         min_estimated_gain_chars: int = 1,
         semantic_guard: SemanticGuard | None = None,
+        utility_validator: UtilityPreservationValidator | None = None,
+        cache_estimator: str | CacheEstimator | None = None,
         rejected_move_risk_tags: Sequence[str] = ("natural_language_segment",),
     ) -> None:
         self.min_estimated_gain_chars = min_estimated_gain_chars
         self.semantic_guard = semantic_guard
+        self.utility_validator = utility_validator
+        self.cache_estimator = resolve_cache_estimator(cache_estimator)
         self.rejected_move_risk_tags = tuple(str(tag) for tag in rejected_move_risk_tags)
 
     def validate(
@@ -58,36 +99,26 @@ class CacheUtilityValidator:
         json_output: Any = None,
         extra_create_args: Mapping[str, Any] | None = None,
     ) -> ValidationReport:
-        utility_estimate = self._estimate_cache_utility(compile_result, plan)
+        utility_estimate = self._estimate_cache_utility(compile_result, plan, cache_estimate_report=None)
 
         if plan.fallback_required:
-            return ValidationReport(
-                False,
-                True,
-                plan.fallback_reason or "planner_required_fallback",
-                utility_estimate,
-                None,
-                plan.risk_notes,
+            return self._fail(
+                reason=plan.fallback_reason or "planner_required_fallback",
+                utility_estimate=utility_estimate,
+                risk_notes=plan.risk_notes,
             )
 
         original_ids = tuple(block.block_id for block in compile_result.blocks)
         if Counter(original_ids) != Counter(plan.new_order):
-            return ValidationReport(False, True, "block_id_multiset_changed", utility_estimate, None, plan.risk_notes)
+            return self._fail("block_id_multiset_changed", utility_estimate, plan.risk_notes)
 
         if plan.prefix_tree is None:
-            return ValidationReport(False, True, "prefix_tree_missing", utility_estimate, None, plan.risk_notes)
+            return self._fail("prefix_tree_missing", utility_estimate, plan.risk_notes)
         tree_ids = tuple(self._iter_tree_block_ids(plan.prefix_tree.root))
         if Counter(tree_ids) != Counter(original_ids):
-            return ValidationReport(
-                False,
-                True,
-                "prefix_tree_block_coverage_mismatch",
-                utility_estimate,
-                None,
-                plan.risk_notes,
-            )
+            return self._fail("prefix_tree_block_coverage_mismatch", utility_estimate, plan.risk_notes)
         if not self._cacheable_prefix_is_front_loaded(plan):
-            return ValidationReport(False, True, "cacheable_prefix_not_at_front", utility_estimate, None, plan.risk_notes)
+            return self._fail("cacheable_prefix_not_at_front", utility_estimate, plan.risk_notes)
 
         original_hashes = Counter(block.content_hash for block in compile_result.blocks)
         planned_hashes = Counter(
@@ -96,13 +127,13 @@ class CacheUtilityValidator:
             if block.block_id in set(plan.new_order)
         )
         if original_hashes != planned_hashes:
-            return ValidationReport(False, True, "block_hash_multiset_changed", utility_estimate, None, plan.risk_notes)
+            return self._fail("block_hash_multiset_changed", utility_estimate, plan.risk_notes)
 
         if compile_result.tools_hash != hash_tools(tools):
-            return ValidationReport(False, True, "tools_hash_changed", utility_estimate, None, plan.risk_notes)
+            return self._fail("tools_hash_changed", utility_estimate, plan.risk_notes)
 
         if compile_result.model_args_hash != hash_model_args(tool_choice, json_output, extra_create_args):
-            return ValidationReport(False, True, "model_args_hash_changed", utility_estimate, None, plan.risk_notes)
+            return self._fail("model_args_hash_changed", utility_estimate, plan.risk_notes)
 
         forbidden_original_order: list[str] = []
         forbidden_new_order = [
@@ -118,23 +149,9 @@ class CacheUtilityValidator:
             if block.movability in {Movability.NEVER_MOVE, Movability.LOCAL_ONLY, Movability.ORDER_SENSITIVE}:
                 forbidden_original_order.append(block.block_id)
                 if block.block_id in plan.moved_blocks:
-                    return ValidationReport(
-                        False,
-                        True,
-                        f"forbidden_block_moved:{block.block_id}",
-                        utility_estimate,
-                        None,
-                        plan.risk_notes,
-                    )
+                    return self._fail(f"forbidden_block_moved:{block.block_id}", utility_estimate, plan.risk_notes)
         if tuple(forbidden_original_order) != tuple(forbidden_new_order):
-            return ValidationReport(
-                False,
-                True,
-                "forbidden_block_relative_order_changed",
-                utility_estimate,
-                None,
-                plan.risk_notes,
-            )
+            return self._fail("forbidden_block_relative_order_changed", utility_estimate, plan.risk_notes)
 
         message_shape_reason = self._message_shape_violation_reason(
             original_messages=original_messages,
@@ -143,28 +160,68 @@ class CacheUtilityValidator:
             plan=plan,
         )
         if message_shape_reason is not None:
-            return ValidationReport(False, True, message_shape_reason, utility_estimate, None, plan.risk_notes)
+            return self._fail(message_shape_reason, utility_estimate, plan.risk_notes)
 
         if plan.moved_blocks and not self._rewritten_messages_match_plan(
             rewritten_messages=rewritten_messages,
             compile_result=compile_result,
             plan=plan,
         ):
-            return ValidationReport(False, True, "rewritten_content_mismatch", utility_estimate, None, plan.risk_notes)
+            return self._fail("rewritten_content_mismatch", utility_estimate, plan.risk_notes)
 
         rejected_risk_tags = self._moved_rejected_risk_tags(compile_result, plan)
         if rejected_risk_tags:
-            return ValidationReport(
-                False,
-                True,
+            return self._fail(
                 "calibrated_utility_risk:" + ",".join(rejected_risk_tags),
                 utility_estimate,
-                None,
                 tuple((*plan.risk_notes, *(f"moved_risk_tag:{tag}" for tag in rejected_risk_tags))),
             )
 
-        if plan.moved_blocks and utility_estimate.estimated_gain_chars < self.min_estimated_gain_chars:
-            return ValidationReport(False, True, "insufficient_cache_utility", utility_estimate, None, plan.risk_notes)
+        utility_preservation_report = self._run_utility_preservation_gate(
+            original_messages=original_messages,
+            rewritten_messages=rewritten_messages,
+            compile_result=compile_result,
+            plan=plan,
+            cache_utility_estimate=utility_estimate,
+        )
+        if utility_preservation_report.is_utility_preserved is False:
+            return ValidationReport(
+                False,
+                True,
+                f"utility_preservation_failed:{utility_preservation_report.reason}",
+                utility_estimate,
+                None,
+                plan.risk_notes,
+                utility_preservation_report,
+                hard_constraint_passed=True,
+                hard_constraint_report=self._hard_constraint_report("passed"),
+                utility_status=utility_preservation_report.utility_status,
+                cache_hit_increased=False if plan.moved_blocks else None,
+            )
+
+        cache_estimate_report = self._estimate_cache(
+            original_messages=original_messages,
+            rewritten_messages=rewritten_messages,
+            compile_result=compile_result,
+            plan=plan,
+        )
+        utility_estimate = self._estimate_cache_utility(compile_result, plan, cache_estimate_report)
+
+        if plan.moved_blocks and cache_gate_value(cache_estimate_report) < self.min_estimated_gain_chars:
+            return ValidationReport(
+                False,
+                True,
+                "insufficient_cache_utility",
+                utility_estimate,
+                None,
+                plan.risk_notes,
+                utility_preservation_report,
+                hard_constraint_passed=True,
+                hard_constraint_report=self._hard_constraint_report("passed"),
+                utility_status=utility_preservation_report.utility_status,
+                cache_hit_increased=False,
+                cache_estimate_report=cache_estimate_report,
+            )
 
         semantic_guard_report = self._run_semantic_guard(
             original_messages=original_messages,
@@ -180,8 +237,15 @@ class CacheUtilityValidator:
                 utility_estimate,
                 semantic_guard_report,
                 plan.risk_notes,
+                utility_preservation_report,
+                hard_constraint_passed=True,
+                hard_constraint_report=self._hard_constraint_report("passed"),
+                utility_status=utility_preservation_report.utility_status,
+                cache_hit_increased=self._cache_hit_increased(plan, cache_estimate_report),
+                cache_estimate_report=cache_estimate_report,
             )
 
+        cache_hit_increased = self._cache_hit_increased(plan, cache_estimate_report)
         return ValidationReport(
             applied=bool(plan.moved_blocks),
             fallback=False,
@@ -189,7 +253,109 @@ class CacheUtilityValidator:
             utility_estimate=utility_estimate,
             semantic_guard_report=semantic_guard_report,
             risk_notes=plan.risk_notes,
+            utility_preservation_report=utility_preservation_report,
+            hard_constraint_passed=True,
+            hard_constraint_report=self._hard_constraint_report("passed"),
+            utility_status=utility_preservation_report.utility_status,
+            cache_hit_increased=cache_hit_increased,
+            cache_estimate_report=cache_estimate_report,
         )
+
+    def _fail(
+        self,
+        reason: str,
+        utility_estimate: CacheUtilityEstimate | None,
+        risk_notes: tuple[str, ...],
+    ) -> ValidationReport:
+        return ValidationReport(
+            applied=False,
+            fallback=True,
+            reason=reason,
+            utility_estimate=utility_estimate,
+            risk_notes=risk_notes,
+            hard_constraint_passed=False,
+            hard_constraint_report=self._hard_constraint_report("failed", reason=reason),
+            utility_status="not_run",
+            cache_hit_increased=False,
+            cache_estimate_report=(
+                utility_estimate.cache_estimate_report
+                if utility_estimate is not None
+                else None
+            ),
+        )
+
+    def _hard_constraint_report(self, status: str, *, reason: str | None = None) -> Mapping[str, Any]:
+        return {
+            "schema_version": "prefix-hard-constraint-report-v1",
+            "status": status,
+            "passed": status == "passed",
+            "reason": reason,
+            "checks": (
+                "block_multiset_preserved",
+                "block_hash_multiset_preserved",
+                "tools_hash_unchanged",
+                "model_args_hash_unchanged",
+                "forbidden_blocks_not_moved",
+                "conversation_shape_preserved",
+                "rewritten_content_matches_plan",
+                "prefix_tree_covers_blocks",
+                "cacheable_prefix_front_loaded",
+            ),
+        }
+
+    def _run_utility_preservation_gate(
+        self,
+        *,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+        cache_utility_estimate: CacheUtilityEstimate,
+    ) -> UtilityPreservationReport:
+        if not plan.moved_blocks:
+            return UtilityPreservationReport(
+                is_utility_preserved=None,
+                confidence=1.0,
+                reason="no_rewrite_needed",
+                checks=("hard_constraints_passed",),
+                utility_status="unverified",
+            )
+        if self.utility_validator is None:
+            return UtilityPreservationReport(
+                is_utility_preserved=None,
+                confidence=0.0,
+                reason="utility_validator_not_configured",
+                checks=("hard_constraints_passed", "interface_reserved"),
+                utility_status="not_configured",
+            )
+        try:
+            report = self.utility_validator.evaluate(
+                original_messages=original_messages,
+                rewritten_messages=rewritten_messages,
+                compile_result=compile_result,
+                plan=plan,
+                cache_utility_estimate=cache_utility_estimate,
+            )
+            if report.utility_status == "unverified":
+                status = "passed" if report.is_utility_preserved is True else "failed" if report.is_utility_preserved is False else "unverified"
+                return UtilityPreservationReport(
+                    is_utility_preserved=report.is_utility_preserved,
+                    confidence=report.confidence,
+                    reason=report.reason,
+                    checks=report.checks,
+                    model_name=report.model_name,
+                    prompt_safe=report.prompt_safe,
+                    utility_status=status,
+                )
+            return report
+        except Exception as exc:  # noqa: BLE001
+            return UtilityPreservationReport(
+                is_utility_preserved=False,
+                confidence=0.0,
+                reason=f"exception:{type(exc).__name__}",
+                checks=("utility_validator_exception",),
+                utility_status="failed",
+            )
 
     def _run_semantic_guard(
         self,
@@ -390,7 +556,45 @@ class CacheUtilityValidator:
             matched.update(tag for tag in block.risk_tags if tag in rejected)
         return tuple(sorted(matched))
 
-    def _estimate_cache_utility(self, compile_result: CompileResult, plan: PrefixPlan) -> CacheUtilityEstimate:
+    def _cache_hit_increased(self, plan: PrefixPlan, cache_estimate_report: CacheEstimateReport | None) -> bool | None:
+        if not plan.moved_blocks:
+            return None
+        return cache_gate_value(cache_estimate_report) >= self.min_estimated_gain_chars
+
+    def _estimate_cache(
+        self,
+        *,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+    ) -> CacheEstimateReport:
+        try:
+            return self.cache_estimator.estimate(
+                original_messages,
+                rewritten_messages,
+                candidate=plan.prefix_tree_candidate,
+                context={
+                    "compile_result": compile_result,
+                    "plan": plan,
+                    "session_id": compile_result.session_id,
+                    "candidate": plan.prefix_tree_candidate,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return CacheEstimateReport(
+                estimator_name=type(self.cache_estimator).__name__,
+                estimator_available=False,
+                reason=f"cache_estimator_exception:{type(exc).__name__}",
+                warnings=("cache_estimator_exception",),
+            )
+
+    def _estimate_cache_utility(
+        self,
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+        cache_estimate_report: CacheEstimateReport | None,
+    ) -> CacheUtilityEstimate:
         blocks_by_id = {block.block_id: block for block in compile_result.blocks}
         cacheable_ids = tuple(block_id for block_id in plan.cacheable_prefix_blocks if block_id in blocks_by_id)
         cacheable_set = set(cacheable_ids)
@@ -407,14 +611,29 @@ class CacheUtilityValidator:
         after_fingerprint = stable_hash(
             [(block_id, blocks_by_id[block_id].content_hash) for block_id in plan.new_order if block_id in blocks_by_id]
         )
+        cache_report = plan.cache_gain_report or {}
+        if cache_estimate_report is not None:
+            estimated_gain_chars = int(max(0, cache_gate_value(cache_estimate_report)))
+        else:
+            estimated_gain_chars = max(0, rewritten_prefix_chars - original_prefix_chars)
+            if plan.moved_blocks and cache_report.get("estimated_cache_gain") is not None:
+                estimated_gain_chars = max(estimated_gain_chars, int(cache_report.get("estimated_cache_gain") or 0))
         return CacheUtilityEstimate(
             cacheable_prefix_blocks=cacheable_ids,
             original_prefix_chars=original_prefix_chars,
             rewritten_prefix_chars=rewritten_prefix_chars,
             moved_block_chars=moved_block_chars,
-            estimated_gain_chars=max(0, rewritten_prefix_chars - original_prefix_chars),
+            estimated_gain_chars=estimated_gain_chars,
             prefix_fingerprint_before=before_fingerprint,
             prefix_fingerprint_after=after_fingerprint,
+            longest_common_prefix_tokens=int(cache_report.get("longest_common_prefix_tokens") or 0),
+            global_prefix_tokens=int(cache_report.get("global_prefix_tokens") or 0),
+            subgroup_prefix_tokens=int(cache_report.get("subgroup_prefix_tokens") or 0),
+            node_cache_contributions=cache_report.get("node_cache_contributions")
+            if isinstance(cache_report.get("node_cache_contributions"), Mapping)
+            else None,
+            cache_gain_report=cache_report if cache_report else None,
+            cache_estimate_report=cache_estimate_report,
         )
 
     def _leading_cacheable_chars(
