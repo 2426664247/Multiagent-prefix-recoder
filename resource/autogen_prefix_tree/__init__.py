@@ -51,7 +51,13 @@ from .utility_oracles import (
     ToolTraceOracle,
     UnitTestOracle,
 )
-from .validator import CacheUtilityEstimate, CacheUtilityValidator, UtilityPreservationReport, ValidationReport
+from .validator import (
+    CacheUtilityEstimate,
+    CacheUtilityValidator,
+    UtilityModelGateReport,
+    UtilityPreservationReport,
+    ValidationReport,
+)
 
 __all__ = [
     "BlockPlacement",
@@ -81,6 +87,7 @@ __all__ = [
     "OpenAICompatibleSemanticGuardConfig",
     "OracleResult",
     "PrefixPlan",
+    "PlannerRankerModel",
     "PrefixTreeEstimator",
     "PrefixScope",
     "PrefixReorderClient",
@@ -107,12 +114,15 @@ __all__ = [
     "UnitTestOracle",
     "UtilityDatasetBuildResult",
     "UtilityGoldsetTemplateResult",
+    "UtilityModelGateReport",
+    "UtilityValidatorModel",
     "UtilityPreservationReport",
     "ValidationReport",
     "load_jsonl_feedback",
     "load_jsonl_telemetry",
     "build_humaneval_utility_goldset_template",
     "build_utility_validator_smoke_dataset",
+    "discover_expanded_dataset_paths",
     "build_replay_run_record",
     "build_local_judge_goldset_template",
     "export_goldset_template_csv",
@@ -121,6 +131,8 @@ __all__ = [
     "run_local_judge_quality_eval",
     "rewrite_messages",
     "load_replay_run",
+    "load_expanded_utility_validator_dataset",
+    "load_planner_ranker_dataset",
     "replay_candidate",
     "revalidate_candidate",
     "export_utility_labeling_samples",
@@ -129,6 +141,8 @@ __all__ = [
     "resolve_cache_estimator",
     "summarize_feedback_records",
     "summarize_telemetry",
+    "train_utility_validator_baseline_v0",
+    "train_planner_ranker_baseline_v0",
     "validate_local_judge_goldset",
     "verify_local_judge_goldset_chain",
 ]
@@ -250,6 +264,43 @@ def __getattr__(name: str):
         values = {
             "UtilityDatasetBuildResult": UtilityDatasetBuildResult,
             "build_utility_validator_smoke_dataset": build_utility_validator_smoke_dataset,
+        }
+        return values[name]
+    if name in {
+        "UtilityValidatorModel",
+        "discover_expanded_dataset_paths",
+        "load_expanded_utility_validator_dataset",
+        "train_utility_validator_baseline_v0",
+    }:
+        from .utility_validator_baseline import (
+            UtilityValidatorModel,
+            discover_expanded_dataset_paths,
+            load_expanded_utility_validator_dataset,
+            train_utility_validator_baseline_v0,
+        )
+
+        values = {
+            "UtilityValidatorModel": UtilityValidatorModel,
+            "discover_expanded_dataset_paths": discover_expanded_dataset_paths,
+            "load_expanded_utility_validator_dataset": load_expanded_utility_validator_dataset,
+            "train_utility_validator_baseline_v0": train_utility_validator_baseline_v0,
+        }
+        return values[name]
+    if name in {
+        "PlannerRankerModel",
+        "load_planner_ranker_dataset",
+        "train_planner_ranker_baseline_v0",
+    }:
+        from .planner_ranker_baseline import (
+            PlannerRankerModel,
+            load_planner_ranker_dataset,
+            train_planner_ranker_baseline_v0,
+        )
+
+        values = {
+            "PlannerRankerModel": PlannerRankerModel,
+            "load_planner_ranker_dataset": load_planner_ranker_dataset,
+            "train_planner_ranker_baseline_v0": train_planner_ranker_baseline_v0,
         }
         return values[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -9,9 +9,13 @@ from typing import Any
 import pytest
 
 from autogen_prefix_tree.utility_dataset_builder import (
+    build_expanded_utility_validator_dataset,
+    build_full_utility_validator_dataset,
     build_utility_validator_smoke_dataset,
     build_readiness_report,
     ensure_utility_dataset_layout,
+    update_expanded_build_summary_with_pytest,
+    update_full_build_summary_with_pytest,
     update_readiness_report_with_pytest,
 )
 from autogen_prefix_tree.utility_dataset_sources import (
@@ -352,8 +356,170 @@ def test_pilot_real_expands_tasks_and_writes_readiness(tmp_path) -> None:
     assert readiness["checks"]["model_is_not_pro"] is True
 
 
+def test_train_real_batches_checkpoints_and_writes_final_splits(tmp_path) -> None:
+    seen_requests: list[dict[str, Any]] = []
+    server = _start_fake_dsapi(seen_requests)
+    config_path = tmp_path / "dsapi_config.txt"
+    config_path.write_text(
+        "\n".join(
+            [
+                "api_key: sk-test-secret",
+                "model: deepseek-v4-pro",
+                f"base_url: http://127.0.0.1:{server.server_port}/v1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    try:
+        result = build_full_utility_validator_dataset(
+            repo_root=Path("."),
+            output_root=tmp_path / "utility_validator",
+            source="all",
+            backend="dsapi",
+            max_tasks=50,
+            batch_size=25,
+            checkpoint_api_calls=100,
+            max_api_calls=120,
+            confirm_cost_aware=True,
+            model="v4flash",
+            project_config_path=config_path,
+            created_at="2026-06-12T00:00:00Z",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    summary = update_full_build_summary_with_pytest(
+        output_root=tmp_path / "utility_validator",
+        pytest_q_passed=True,
+        pytest_report={"command": "pytest -q", "exit_code": 0},
+    )
+    root = tmp_path / "utility_validator"
+    train_labels = _read_jsonl(root / "labels" / "train" / "utility_labels.jsonl")
+    valid_labels = _read_jsonl(root / "labels" / "valid" / "utility_labels.jsonl")
+    test_labels = _read_jsonl(root / "labels" / "test" / "utility_labels.jsonl")
+    train_features = _read_jsonl(root / "features" / "train" / "train_features.jsonl")
+    valid_features = _read_jsonl(root / "features" / "valid" / "valid_features.jsonl")
+    test_features = _read_jsonl(root / "features" / "test" / "test_features.jsonl")
+    serialized = json.dumps({"summary": summary}, ensure_ascii=False)
+
+    assert result.summary["api_model"] == "deepseek-v4-flash"
+    assert result.summary["checkpoint_count"] == 2
+    assert result.summary["anomalous_batch_count"] == 0
+    assert len(train_labels) + len(valid_labels) + len(test_labels) == 50
+    trainable_count = sum(
+        1 for label in train_labels + valid_labels + test_labels if label["is_utility_preserved"] in {True, False}
+    )
+    assert len(train_features) + len(valid_features) + len(test_features) == trainable_count
+    assert result.summary["split_counts"]["train"]["label_count"] == len(train_labels)
+    assert all(label["label_source"] == "dsapi_execution_oracle" for label in train_labels + valid_labels + test_labels)
+    assert all(request["body"]["model"] == "deepseek-v4-flash" for request in seen_requests)
+    assert "sk-test-secret" not in serialized
+    assert summary["ready_for_baseline_training"] is True
+    assert Path(summary["dataset_card_path"]).exists()
+    assert Path(summary["training_usage_path"]).exists()
+
+
+def test_expanded_real_merges_seed_and_writes_expanded_splits(tmp_path) -> None:
+    seen_requests: list[dict[str, Any]] = []
+    server = _start_fake_dsapi(seen_requests)
+    config_path = tmp_path / "dsapi_config.txt"
+    config_path.write_text(
+        "\n".join(
+            [
+                "api_key: sk-test-secret",
+                "model: deepseek-v4-pro",
+                f"base_url: http://127.0.0.1:{server.server_port}/v1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    try:
+        build_full_utility_validator_dataset(
+            repo_root=Path("."),
+            output_root=tmp_path / "utility_validator",
+            source="all",
+            backend="dsapi",
+            max_tasks=15,
+            batch_size=15,
+            checkpoint_api_calls=100,
+            max_api_calls=40,
+            confirm_cost_aware=True,
+            model="v4flash",
+            project_config_path=config_path,
+            created_at="2026-06-12T00:00:00Z",
+        )
+        result = build_expanded_utility_validator_dataset(
+            repo_root=Path("."),
+            output_root=tmp_path / "utility_validator",
+            source="all",
+            backend="dsapi",
+            max_tasks=20,
+            batch_size=10,
+            checkpoint_api_calls=100,
+            max_api_calls=100,
+            confirm_cost_aware=True,
+            model="v4flash",
+            project_config_path=config_path,
+            target_true_count=30,
+            target_false_count=0,
+            created_at="2026-06-12T00:00:00Z",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    summary = update_expanded_build_summary_with_pytest(
+        output_root=tmp_path / "utility_validator",
+        pytest_q_passed=True,
+        pytest_report={"command": "pytest -q", "exit_code": 0},
+    )
+    root = tmp_path / "utility_validator"
+    labels = (
+        _read_jsonl(root / "labels" / "expanded_train" / "utility_labels.jsonl")
+        + _read_jsonl(root / "labels" / "expanded_valid" / "utility_labels.jsonl")
+        + _read_jsonl(root / "labels" / "expanded_test" / "utility_labels.jsonl")
+    )
+    features = (
+        _read_jsonl(root / "features" / "expanded_train" / "train_features.jsonl")
+        + _read_jsonl(root / "features" / "expanded_valid" / "valid_features.jsonl")
+        + _read_jsonl(root / "features" / "expanded_test" / "test_features.jsonl")
+    )
+    serialized = json.dumps({"summary": summary}, ensure_ascii=False)
+
+    assert result.summary["api_model"] == "deepseek-v4-flash"
+    assert result.summary["mode"] == "expanded_real"
+    assert result.summary["seed_label_count"] == 15
+    assert result.summary["new_label_count"] > 0
+    assert result.summary["anomalous_batch_count"] == 0
+    assert {label["candidate_strategy"] for label in labels} >= {"balanced", "adversarial"}
+    assert len({label["label_id"] for label in labels}) == len(labels)
+    assert len({feature["sample_id"] for feature in features}) == len(features)
+    assert any(
+        count > 1
+        for count in _counts(label["task_id"] for label in labels).values()
+    )
+    assert all(feature["original_run_status"] == "passed" for feature in features)
+    assert all(feature["reordered_run_status"] in {"passed", "failed"} for feature in features)
+    assert all(label["label_source"] == "dsapi_execution_oracle" for label in labels)
+    assert all(label["prompt_text_included"] is False for label in labels)
+    assert len(features) == sum(1 for label in labels if label["is_utility_preserved"] in {True, False})
+    assert all(request["body"]["model"] == "deepseek-v4-flash" for request in seen_requests)
+    assert "sk-test-secret" not in serialized
+    assert summary["ready_for_baseline_training"] is True
+    assert Path(summary["dataset_card_path"]).exists()
+    assert Path(summary["training_usage_path"]).exists()
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _counts(values: list[Any] | tuple[Any, ...]) -> dict[Any, int]:
+    counts: dict[Any, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def _header_value(headers: dict[str, Any], name: str) -> str | None:
@@ -398,8 +564,12 @@ def _start_fake_dsapi(seen_requests: list[dict[str, Any]]) -> ThreadingHTTPServe
                 content = {"status": "passed", "text": "Role-safe result.", "role_boundary_ok": True}
             elif "observed_event_order" in system_content:
                 marker = '"observed_event_order":'
-                raw_order = system_content.split(marker, 1)[1].rsplit("}", 1)[0]
-                content = {"status": "passed", "state_consistent": True, "observed_event_order": json.loads(raw_order)}
+                if marker in system_content:
+                    raw_order = system_content.split(marker, 1)[1].rsplit("}", 1)[0]
+                    observed_order = json.loads(raw_order)
+                else:
+                    observed_order = []
+                content = {"status": "passed", "state_consistent": True, "observed_event_order": observed_order}
             elif "ticket id T-42" in user_content:
                 content = {"ticket_id": "T-42", "status": "open"}
             elif "Answer yes" in user_content:

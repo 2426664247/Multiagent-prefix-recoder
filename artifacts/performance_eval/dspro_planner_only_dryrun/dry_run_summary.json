@@ -1,0 +1,22 @@
+{
+  "ds_api_called": false,
+  "force_front_loaded_common_prefix": false,
+  "optimized_prompt_count": 100,
+  "planner_ranker_loaded": true,
+  "prompt_budget": {
+    "baseline_prompt_chars": 214416,
+    "estimate_method": "prompt_chars_div_3.6_before_provider_tokenization",
+    "estimated_total_input_tokens": 119120,
+    "optimized_prompt_chars_floor": 214416
+  },
+  "schema_version": "dspro-performance-eval-dry-run-v1",
+  "source_counts": {
+    "format_protocol": 20,
+    "history_state": 20,
+    "humaneval": 20,
+    "role_privacy": 20,
+    "synthetic_agent": 20
+  },
+  "task_count": 100,
+  "utility_model_loaded": true
+}

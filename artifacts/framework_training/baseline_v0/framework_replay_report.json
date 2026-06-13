@@ -1,0 +1,122 @@
+{
+  "cache_gain_gate_checked": true,
+  "ds_api_called": false,
+  "hard_gate_checked": true,
+  "model_gate_if_enabled_checked": true,
+  "planner_ranker_sorting_checked": true,
+  "prompt_text_used": false,
+  "risk_summary": {
+    "false_kill_risk_count": 3,
+    "leak_risk_count": 1,
+    "planner_top_5_unsafe_count": 0
+  },
+  "runtime_replay_smoke": {
+    "default_validation": {
+      "applied": true,
+      "cache_gate_result": "passed",
+      "cache_hit_increased": true,
+      "fallback": false,
+      "hard_constraint_passed": true,
+      "hard_gate_result": "passed",
+      "reason": "validated",
+      "utility_model_confidence": 0.0,
+      "utility_model_gate_report": {
+        "cache_gate_result": "passed",
+        "hard_gate_result": "passed",
+        "mode": "disabled",
+        "model_name": null,
+        "prompt_safe": true,
+        "reason": "utility_model_not_configured",
+        "utility_model_confidence": 0.0,
+        "utility_model_prediction": null,
+        "utility_model_shadow_decision": "not_configured",
+        "utility_model_threshold": null
+      },
+      "utility_model_prediction": null,
+      "utility_model_shadow_decision": "not_configured",
+      "utility_model_threshold": null,
+      "utility_status": "not_configured"
+    },
+    "gate_if_enabled_validation": {
+      "applied": true,
+      "cache_gate_result": "passed",
+      "cache_hit_increased": true,
+      "fallback": false,
+      "hard_constraint_passed": true,
+      "hard_gate_result": "passed",
+      "reason": "validated",
+      "utility_model_confidence": 0.5153272634535753,
+      "utility_model_gate_report": {
+        "cache_gate_result": "passed",
+        "hard_gate_result": "passed",
+        "mode": "gate",
+        "model_name": "utility_validator_baseline_v0:random_forest_balanced",
+        "prompt_safe": true,
+        "reason": "baseline model prediction from structured placement features",
+        "utility_model_confidence": 0.5153272634535753,
+        "utility_model_prediction": false,
+        "utility_model_shadow_decision": "observe",
+        "utility_model_threshold": 0.5289255574007625
+      },
+      "utility_model_prediction": false,
+      "utility_model_shadow_decision": "observe",
+      "utility_model_threshold": 0.5289255574007625,
+      "utility_status": "not_configured"
+    },
+    "planner_ranker_runtime_prediction": {
+      "confidence": 0.4362778618358531,
+      "is_priority_candidate": true,
+      "model_name": "planner_ranker_baseline_v0:random_forest_balanced",
+      "priority_probability": 0.4362778618358531,
+      "priority_score": 0.4362778618358531,
+      "reason": "planner ranker baseline prediction from structured candidate and placement features",
+      "threshold": 0.16559618217475175
+    },
+    "prompt_text_included": false,
+    "replay_record_shadow_fields": {
+      "cache_gate_result": "passed",
+      "hard_gate_result": "passed",
+      "utility_model_confidence": 0.5153272634535753,
+      "utility_model_prediction": false,
+      "utility_model_shadow_decision": "observe",
+      "utility_model_threshold": 0.5289255574007625
+    },
+    "schema_version": "framework-runtime-replay-smoke-v1",
+    "shadow_does_not_change_default_decision": true,
+    "shadow_validation": {
+      "applied": true,
+      "cache_gate_result": "passed",
+      "cache_hit_increased": true,
+      "fallback": false,
+      "hard_constraint_passed": true,
+      "hard_gate_result": "passed",
+      "reason": "validated",
+      "utility_model_confidence": 0.5153272634535753,
+      "utility_model_gate_report": {
+        "cache_gate_result": "passed",
+        "hard_gate_result": "passed",
+        "mode": "shadow",
+        "model_name": "utility_validator_baseline_v0:random_forest_balanced",
+        "prompt_safe": true,
+        "reason": "baseline model prediction from structured placement features",
+        "utility_model_confidence": 0.5153272634535753,
+        "utility_model_prediction": false,
+        "utility_model_shadow_decision": "observe",
+        "utility_model_threshold": 0.5289255574007625
+      },
+      "utility_model_prediction": false,
+      "utility_model_shadow_decision": "observe",
+      "utility_model_threshold": 0.5289255574007625,
+      "utility_status": "not_configured"
+    }
+  },
+  "sample_level_model_gate_if_enabled": {
+    "accepted_count": 12,
+    "false_kill_risk_count": 3,
+    "leak_risk_count": 1,
+    "observe_count": 2,
+    "rejected_count": 6
+  },
+  "schema_version": "framework-replay-report-v1",
+  "utility_validator_shadow_checked": true
+}

@@ -72,6 +72,7 @@ def build_replay_run_record(
         )
         for message in compile_result.messages
     )
+    utility_model_gate = dataclass_to_dict(validation_report.utility_model_gate_report) or {}
     return {
         "schema_version": "prefix-replay-run-v1",
         "run_id": run_id,
@@ -94,6 +95,23 @@ def build_replay_run_record(
         "planner_score_breakdown": plan.planner_score_breakdown,
         "hard_validator_report": validation_report.hard_constraint_report,
         "utility_validator_report": dataclass_to_dict(validation_report.utility_preservation_report),
+        "utility_model_gate_report": utility_model_gate,
+        "utility_model_prediction": utility_model_gate.get("utility_model_prediction"),
+        "utility_model_confidence": utility_model_gate.get("utility_model_confidence"),
+        "utility_model_threshold": utility_model_gate.get("utility_model_threshold"),
+        "utility_model_shadow_decision": utility_model_gate.get("utility_model_shadow_decision"),
+        "hard_gate_result": utility_model_gate.get(
+            "hard_gate_result",
+            "passed" if validation_report.hard_constraint_passed else "failed",
+        ),
+        "cache_gate_result": utility_model_gate.get(
+            "cache_gate_result",
+            "passed"
+            if validation_report.cache_hit_increased
+            else "failed"
+            if validation_report.cache_hit_increased is False
+            else "not_run",
+        ),
         "cache_gain_report": plan.cache_gain_report,
         "cache_estimate_report": dataclass_to_dict(validation_report.cache_estimate_report),
         "final_decision": final_decision,

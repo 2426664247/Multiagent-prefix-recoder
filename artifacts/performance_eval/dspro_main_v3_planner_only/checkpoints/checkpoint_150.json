@@ -1,0 +1,31 @@
+{
+  "api_call_count": 150,
+  "baseline_rows": 75,
+  "checkpoint_errors_before": [],
+  "cost_summary": {
+    "api_call_count": 150,
+    "api_key_stored": false,
+    "base_url": "https://api.deepseek.com/v1",
+    "config_source": "config/config.txt",
+    "estimated_cost_usd": 0.24035316,
+    "latency_seconds_avg": 2.4740526586665754,
+    "latency_seconds_total": 371.1078987999863,
+    "max_api_calls": 240,
+    "model": "deepseek-v4-pro",
+    "model_is_flash": false,
+    "model_is_pro": true,
+    "price_cached_input_per_million": 0.174,
+    "price_input_per_million": 1.74,
+    "price_output_per_million": 3.48,
+    "provider": "deepseek",
+    "provider_cost_usd": 0.0,
+    "total_cache_miss_tokens": 96506,
+    "total_cached_tokens": 0,
+    "total_input_tokens": 96506,
+    "total_output_tokens": 20814,
+    "total_tokens": 117320
+  },
+  "created_at": "2026-06-13T17:54:00Z",
+  "optimized_rows": 75,
+  "schema_version": "dspro-performance-checkpoint-v1"
+}

@@ -1,0 +1,49 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='1120' height='520' viewBox='0 0 1120 520'>
+  <rect width='100%' height='100%' fill='white'/>
+  <text x='76' y='28' font-size='20' font-weight='700' fill='#111'>Utility Validator baseline_v0: Random Forest cumulative tree curve</text>
+  <text x='76' y='50' font-size='13' fill='#555'>Metrics recomputed from model.pkl by including the first N fitted trees; Random Forest has no epoch loss curve.</text>
+  <line x1='76' y1='450.0' x2='840' y2='450.0' stroke='#e6e6e6'/><text x='64' y='454.0' text-anchor='end' font-size='13' fill='#333'>0.0</text><line x1='76' y1='371.6' x2='840' y2='371.6' stroke='#e6e6e6'/><text x='64' y='375.6' text-anchor='end' font-size='13' fill='#333'>0.2</text><line x1='76' y1='293.2' x2='840' y2='293.2' stroke='#e6e6e6'/><text x='64' y='297.2' text-anchor='end' font-size='13' fill='#333'>0.4</text><line x1='76' y1='214.8' x2='840' y2='214.8' stroke='#e6e6e6'/><text x='64' y='218.8' text-anchor='end' font-size='13' fill='#333'>0.6</text><line x1='76' y1='136.4' x2='840' y2='136.4' stroke='#e6e6e6'/><text x='64' y='140.4' text-anchor='end' font-size='13' fill='#333'>0.8</text><line x1='76' y1='58.0' x2='840' y2='58.0' stroke='#e6e6e6'/><text x='64' y='62.0' text-anchor='end' font-size='13' fill='#333'>1.0</text><line x1='76.0' y1='58' x2='76.0' y2='450' stroke='#f2f2f2'/><text x='76.0' y='478' text-anchor='middle' font-size='13' fill='#333'>1</text><line x1='85.7' y1='58' x2='85.7' y2='450' stroke='#f2f2f2'/><text x='85.7' y='478' text-anchor='middle' font-size='13' fill='#333'>2</text><line x1='114.7' y1='58' x2='114.7' y2='450' stroke='#f2f2f2'/><text x='114.7' y='478' text-anchor='middle' font-size='13' fill='#333'>5</text><line x1='163.0' y1='58' x2='163.0' y2='450' stroke='#f2f2f2'/><text x='163.0' y='478' text-anchor='middle' font-size='13' fill='#333'>10</text><line x1='259.7' y1='58' x2='259.7' y2='450' stroke='#f2f2f2'/><text x='259.7' y='478' text-anchor='middle' font-size='13' fill='#333'>20</text><line x1='453.2' y1='58' x2='453.2' y2='450' stroke='#f2f2f2'/><text x='453.2' y='478' text-anchor='middle' font-size='13' fill='#333'>40</text><line x1='840.0' y1='58' x2='840.0' y2='450' stroke='#f2f2f2'/><text x='840.0' y='478' text-anchor='middle' font-size='13' fill='#333'>80</text>
+  <line x1='76' y1='58' x2='76' y2='450' stroke='#222' stroke-width='1.2'/>
+  <line x1='76' y1='450' x2='840' y2='450' stroke='#222' stroke-width='1.2'/>
+  <polyline points='76.0,149.5 85.7,149.5 114.7,136.4 163.0,175.6 259.7,175.6 453.2,136.4 840.0,97.2' fill='none' stroke='#0072B2' stroke-width='3' /><circle cx='76.0' cy='149.5' r='4.5' fill='#0072B2'/>
+<circle cx='85.7' cy='149.5' r='4.5' fill='#0072B2'/>
+<circle cx='114.7' cy='136.4' r='4.5' fill='#0072B2'/>
+<circle cx='163.0' cy='175.6' r='4.5' fill='#0072B2'/>
+<circle cx='259.7' cy='175.6' r='4.5' fill='#0072B2'/>
+<circle cx='453.2' cy='136.4' r='4.5' fill='#0072B2'/>
+<circle cx='840.0' cy='97.2' r='4.5' fill='#0072B2'/><polyline points='76.0,149.5 85.7,149.5 114.7,136.4 163.0,175.6 259.7,175.6 453.2,175.6 840.0,136.4' fill='none' stroke='#56B4E9' stroke-width='3' stroke-dasharray="8 5"/><circle cx='76.0' cy='149.5' r='4.5' fill='#56B4E9'/>
+<circle cx='85.7' cy='149.5' r='4.5' fill='#56B4E9'/>
+<circle cx='114.7' cy='136.4' r='4.5' fill='#56B4E9'/>
+<circle cx='163.0' cy='175.6' r='4.5' fill='#56B4E9'/>
+<circle cx='259.7' cy='175.6' r='4.5' fill='#56B4E9'/>
+<circle cx='453.2' cy='175.6' r='4.5' fill='#56B4E9'/>
+<circle cx='840.0' cy='136.4' r='4.5' fill='#56B4E9'/><polyline points='76.0,136.4 85.7,136.4 114.7,136.4 163.0,214.8 259.7,214.8 453.2,136.4 840.0,58.0' fill='none' stroke='#009E73' stroke-width='3' /><circle cx='76.0' cy='136.4' r='4.5' fill='#009E73'/>
+<circle cx='85.7' cy='136.4' r='4.5' fill='#009E73'/>
+<circle cx='114.7' cy='136.4' r='4.5' fill='#009E73'/>
+<circle cx='163.0' cy='214.8' r='4.5' fill='#009E73'/>
+<circle cx='259.7' cy='214.8' r='4.5' fill='#009E73'/>
+<circle cx='453.2' cy='136.4' r='4.5' fill='#009E73'/>
+<circle cx='840.0' cy='58.0' r='4.5' fill='#009E73'/><polyline points='76.0,136.4 85.7,136.4 114.7,136.4 163.0,214.8 259.7,214.8 453.2,214.8 840.0,136.4' fill='none' stroke='#E69F00' stroke-width='3' stroke-dasharray="8 5"/><circle cx='76.0' cy='136.4' r='4.5' fill='#E69F00'/>
+<circle cx='85.7' cy='136.4' r='4.5' fill='#E69F00'/>
+<circle cx='114.7' cy='136.4' r='4.5' fill='#E69F00'/>
+<circle cx='163.0' cy='214.8' r='4.5' fill='#E69F00'/>
+<circle cx='259.7' cy='214.8' r='4.5' fill='#E69F00'/>
+<circle cx='453.2' cy='214.8' r='4.5' fill='#E69F00'/>
+<circle cx='840.0' cy='136.4' r='4.5' fill='#E69F00'/><polyline points='76.0,371.6 85.7,371.6 114.7,371.6 163.0,293.2 259.7,293.2 453.2,371.6 840.0,450.0' fill='none' stroke='#D55E00' stroke-width='3' /><circle cx='76.0' cy='371.6' r='4.5' fill='#D55E00'/>
+<circle cx='85.7' cy='371.6' r='4.5' fill='#D55E00'/>
+<circle cx='114.7' cy='371.6' r='4.5' fill='#D55E00'/>
+<circle cx='163.0' cy='293.2' r='4.5' fill='#D55E00'/>
+<circle cx='259.7' cy='293.2' r='4.5' fill='#D55E00'/>
+<circle cx='453.2' cy='371.6' r='4.5' fill='#D55E00'/>
+<circle cx='840.0' cy='450.0' r='4.5' fill='#D55E00'/><polyline points='76.0,371.6 85.7,371.6 114.7,371.6 163.0,293.2 259.7,293.2 453.2,293.2 840.0,371.6' fill='none' stroke='#CC79A7' stroke-width='3' stroke-dasharray="8 5"/><circle cx='76.0' cy='371.6' r='4.5' fill='#CC79A7'/>
+<circle cx='85.7' cy='371.6' r='4.5' fill='#CC79A7'/>
+<circle cx='114.7' cy='371.6' r='4.5' fill='#CC79A7'/>
+<circle cx='163.0' cy='293.2' r='4.5' fill='#CC79A7'/>
+<circle cx='259.7' cy='293.2' r='4.5' fill='#CC79A7'/>
+<circle cx='453.2' cy='293.2' r='4.5' fill='#CC79A7'/>
+<circle cx='840.0' cy='371.6' r='4.5' fill='#CC79A7'/>
+  <text x='458.0' y='502' text-anchor='middle' font-size='14' fill='#222'>Number of trees included</text>
+  <text transform='translate(22 254.0) rotate(-90)' text-anchor='middle' font-size='14' fill='#222'>Score / rate</text>
+  <line x1='874' y1='78' x2='908' y2='78' stroke='#0072B2' stroke-width='3' /><circle cx='891' cy='78' r='4.5' fill='#0072B2'/><text x='920' y='83' font-size='14' fill='#222'>valid balanced accuracy</text><line x1='874' y1='112' x2='908' y2='112' stroke='#56B4E9' stroke-width='3' stroke-dasharray="8 5"/><circle cx='891' cy='112' r='4.5' fill='#56B4E9'/><text x='920' y='117' font-size='14' fill='#222'>test balanced accuracy</text><line x1='874' y1='146' x2='908' y2='146' stroke='#009E73' stroke-width='3' /><circle cx='891' cy='146' r='4.5' fill='#009E73'/><text x='920' y='151' font-size='14' fill='#222'>valid negative recall</text><line x1='874' y1='180' x2='908' y2='180' stroke='#E69F00' stroke-width='3' stroke-dasharray="8 5"/><circle cx='891' cy='180' r='4.5' fill='#E69F00'/><text x='920' y='185' font-size='14' fill='#222'>test negative recall</text><line x1='874' y1='214' x2='908' y2='214' stroke='#D55E00' stroke-width='3' /><circle cx='891' cy='214' r='4.5' fill='#D55E00'/><text x='920' y='219' font-size='14' fill='#222'>valid false negative rate</text><line x1='874' y1='248' x2='908' y2='248' stroke='#CC79A7' stroke-width='3' stroke-dasharray="8 5"/><circle cx='891' cy='248' r='4.5' fill='#CC79A7'/><text x='920' y='253' font-size='14' fill='#222'>test false negative rate</text>
+  <text x='874' y='478' font-size='12' fill='#555'>selected threshold = 0.5289</text>
+</svg>

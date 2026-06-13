@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="620" viewBox="0 0 900 620">
+<rect width="100%" height="100%" fill="white"/>
+<text x="110" y="44" font-family="Arial" font-size="24" fill="#222">Cache-Utility Tradeoff</text>
+<line x1="110" y1="500" x2="810" y2="500" stroke="#555" stroke-width="2"/>
+<line x1="110" y1="80" x2="110" y2="500" stroke="#555" stroke-width="2"/>
+<circle cx="679" cy="500" r="7" fill="#e45756"/>
+<text x="689" y="492" font-family="Arial" font-size="13" fill="#222">Overall</text>
+<circle cx="613" cy="500" r="7" fill="#4c78a8"/>
+<text x="623" y="492" font-family="Arial" font-size="13" fill="#222">humaneval</text>
+<circle cx="699" cy="500" r="7" fill="#4c78a8"/>
+<text x="709" y="492" font-family="Arial" font-size="13" fill="#222">synthetic_agent</text>
+<circle cx="700" cy="500" r="7" fill="#4c78a8"/>
+<text x="710" y="492" font-family="Arial" font-size="13" fill="#222">format_protocol</text>
+<circle cx="702" cy="500" r="7" fill="#4c78a8"/>
+<text x="712" y="492" font-family="Arial" font-size="13" fill="#222">role_privacy</text>
+<circle cx="710" cy="500" r="7" fill="#4c78a8"/>
+<text x="720" y="492" font-family="Arial" font-size="13" fill="#222">history_state</text>
+<text x="380" y="565" font-family="Arial" font-size="16" fill="#222">Cache hit rate lift</text>
+<text x="12" y="290" font-family="Arial" font-size="16" fill="#222">Utility drop</text>
+</svg>

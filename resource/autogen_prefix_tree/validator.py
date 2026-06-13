@@ -40,6 +40,20 @@ class UtilityPreservationReport:
     utility_status: str = "unverified"
 
 
+@dataclass(frozen=True)
+class UtilityModelGateReport:
+    utility_model_prediction: bool | None
+    utility_model_confidence: float
+    utility_model_threshold: float | None
+    utility_model_shadow_decision: str
+    hard_gate_result: str
+    cache_gate_result: str
+    mode: str = "disabled"
+    reason: str | None = None
+    model_name: str | None = None
+    prompt_safe: bool = True
+
+
 class UtilityPreservationValidator(Protocol):
     def evaluate(
         self,
@@ -67,6 +81,7 @@ class ValidationReport:
     utility_status: str = "unverified"
     cache_hit_increased: bool | None = None
     cache_estimate_report: CacheEstimateReport | None = None
+    utility_model_gate_report: UtilityModelGateReport | None = None
 
 
 class CacheUtilityValidator:
@@ -78,12 +93,18 @@ class CacheUtilityValidator:
         min_estimated_gain_chars: int = 1,
         semantic_guard: SemanticGuard | None = None,
         utility_validator: UtilityPreservationValidator | None = None,
+        utility_model_validator: UtilityPreservationValidator | None = None,
+        utility_model_mode: str = "disabled",
+        utility_model_min_confidence: float = 0.55,
         cache_estimator: str | CacheEstimator | None = None,
         rejected_move_risk_tags: Sequence[str] = ("natural_language_segment",),
     ) -> None:
         self.min_estimated_gain_chars = min_estimated_gain_chars
         self.semantic_guard = semantic_guard
         self.utility_validator = utility_validator
+        self.utility_model_validator = utility_model_validator
+        self.utility_model_mode = _normalize_utility_model_mode(utility_model_mode)
+        self.utility_model_min_confidence = max(0.0, min(1.0, float(utility_model_min_confidence)))
         self.cache_estimator = resolve_cache_estimator(cache_estimator)
         self.rejected_move_risk_tags = tuple(str(tag) for tag in rejected_move_risk_tags)
 
@@ -177,6 +198,31 @@ class CacheUtilityValidator:
                 tuple((*plan.risk_notes, *(f"moved_risk_tag:{tag}" for tag in rejected_risk_tags))),
             )
 
+        utility_model_gate_report = self._run_utility_model_gate(
+            original_messages=original_messages,
+            rewritten_messages=rewritten_messages,
+            compile_result=compile_result,
+            plan=plan,
+            cache_utility_estimate=utility_estimate,
+            hard_gate_result="passed",
+            cache_gate_result="not_run",
+        )
+        if utility_model_gate_report.utility_model_shadow_decision == "reject":
+            return ValidationReport(
+                False,
+                True,
+                f"utility_model_gate_failed:{utility_model_gate_report.reason}",
+                utility_estimate,
+                None,
+                plan.risk_notes,
+                None,
+                hard_constraint_passed=True,
+                hard_constraint_report=self._hard_constraint_report("passed"),
+                utility_status="failed",
+                cache_hit_increased=False if plan.moved_blocks else None,
+                utility_model_gate_report=utility_model_gate_report,
+            )
+
         utility_preservation_report = self._run_utility_preservation_gate(
             original_messages=original_messages,
             rewritten_messages=rewritten_messages,
@@ -197,6 +243,7 @@ class CacheUtilityValidator:
                 hard_constraint_report=self._hard_constraint_report("passed"),
                 utility_status=utility_preservation_report.utility_status,
                 cache_hit_increased=False if plan.moved_blocks else None,
+                utility_model_gate_report=utility_model_gate_report,
             )
 
         cache_estimate_report = self._estimate_cache(
@@ -206,6 +253,14 @@ class CacheUtilityValidator:
             plan=plan,
         )
         utility_estimate = self._estimate_cache_utility(compile_result, plan, cache_estimate_report)
+        utility_model_gate_report = self._update_utility_model_gate_cache_result(
+            utility_model_gate_report,
+            cache_gate_result=(
+                "passed"
+                if (not plan.moved_blocks or cache_gate_value(cache_estimate_report) >= self.min_estimated_gain_chars)
+                else "failed"
+            ),
+        )
 
         if plan.moved_blocks and cache_gate_value(cache_estimate_report) < self.min_estimated_gain_chars:
             return ValidationReport(
@@ -221,6 +276,7 @@ class CacheUtilityValidator:
                 utility_status=utility_preservation_report.utility_status,
                 cache_hit_increased=False,
                 cache_estimate_report=cache_estimate_report,
+                utility_model_gate_report=utility_model_gate_report,
             )
 
         semantic_guard_report = self._run_semantic_guard(
@@ -243,6 +299,7 @@ class CacheUtilityValidator:
                 utility_status=utility_preservation_report.utility_status,
                 cache_hit_increased=self._cache_hit_increased(plan, cache_estimate_report),
                 cache_estimate_report=cache_estimate_report,
+                utility_model_gate_report=utility_model_gate_report,
             )
 
         cache_hit_increased = self._cache_hit_increased(plan, cache_estimate_report)
@@ -259,6 +316,7 @@ class CacheUtilityValidator:
             utility_status=utility_preservation_report.utility_status,
             cache_hit_increased=cache_hit_increased,
             cache_estimate_report=cache_estimate_report,
+            utility_model_gate_report=utility_model_gate_report,
         )
 
     def _fail(
@@ -281,6 +339,11 @@ class CacheUtilityValidator:
                 utility_estimate.cache_estimate_report
                 if utility_estimate is not None
                 else None
+            ),
+            utility_model_gate_report=self._disabled_utility_model_gate_report(
+                hard_gate_result="failed",
+                cache_gate_result="not_run",
+                reason=reason,
             ),
         )
 
@@ -356,6 +419,110 @@ class CacheUtilityValidator:
                 checks=("utility_validator_exception",),
                 utility_status="failed",
             )
+
+    def _run_utility_model_gate(
+        self,
+        *,
+        original_messages: Sequence[LLMMessage],
+        rewritten_messages: Sequence[LLMMessage],
+        compile_result: CompileResult,
+        plan: PrefixPlan,
+        cache_utility_estimate: CacheUtilityEstimate,
+        hard_gate_result: str,
+        cache_gate_result: str,
+    ) -> UtilityModelGateReport:
+        if self.utility_model_validator is None or self.utility_model_mode == "disabled" or not plan.moved_blocks:
+            reason = "no_rewrite_needed" if not plan.moved_blocks else "utility_model_not_configured"
+            return self._disabled_utility_model_gate_report(
+                hard_gate_result=hard_gate_result,
+                cache_gate_result=cache_gate_result,
+                reason=reason,
+            )
+        try:
+            report = self.utility_model_validator.evaluate(
+                original_messages=original_messages,
+                rewritten_messages=rewritten_messages,
+                compile_result=compile_result,
+                plan=plan,
+                cache_utility_estimate=cache_utility_estimate,
+            )
+            prediction = report.is_utility_preserved
+            confidence = float(report.confidence)
+            threshold = float(getattr(self.utility_model_validator, "threshold", self.utility_model_min_confidence))
+            if prediction is None or confidence < self.utility_model_min_confidence:
+                decision = "observe"
+            elif prediction is False:
+                decision = "reject" if self.utility_model_mode == "gate" else "would_reject"
+            else:
+                decision = "accept" if self.utility_model_mode == "gate" else "would_accept"
+            return UtilityModelGateReport(
+                utility_model_prediction=prediction,
+                utility_model_confidence=confidence,
+                utility_model_threshold=threshold,
+                utility_model_shadow_decision=decision,
+                hard_gate_result=hard_gate_result,
+                cache_gate_result=cache_gate_result,
+                mode=self.utility_model_mode,
+                reason=report.reason,
+                model_name=report.model_name,
+                prompt_safe=report.prompt_safe,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return UtilityModelGateReport(
+                utility_model_prediction=None,
+                utility_model_confidence=0.0,
+                utility_model_threshold=self.utility_model_min_confidence,
+                utility_model_shadow_decision="observe",
+                hard_gate_result=hard_gate_result,
+                cache_gate_result=cache_gate_result,
+                mode=self.utility_model_mode,
+                reason=f"exception:{type(exc).__name__}",
+                model_name=type(self.utility_model_validator).__name__,
+                prompt_safe=True,
+            )
+
+    def _disabled_utility_model_gate_report(
+        self,
+        *,
+        hard_gate_result: str,
+        cache_gate_result: str,
+        reason: str | None = None,
+    ) -> UtilityModelGateReport:
+        return UtilityModelGateReport(
+            utility_model_prediction=None,
+            utility_model_confidence=0.0,
+            utility_model_threshold=(
+                getattr(self.utility_model_validator, "threshold", None)
+                if self.utility_model_validator is not None
+                else None
+            ),
+            utility_model_shadow_decision="not_configured" if self.utility_model_validator is None else "disabled",
+            hard_gate_result=hard_gate_result,
+            cache_gate_result=cache_gate_result,
+            mode=self.utility_model_mode,
+            reason=reason,
+            model_name=getattr(self.utility_model_validator, "model_name", None),
+            prompt_safe=True,
+        )
+
+    def _update_utility_model_gate_cache_result(
+        self,
+        report: UtilityModelGateReport,
+        *,
+        cache_gate_result: str,
+    ) -> UtilityModelGateReport:
+        return UtilityModelGateReport(
+            utility_model_prediction=report.utility_model_prediction,
+            utility_model_confidence=report.utility_model_confidence,
+            utility_model_threshold=report.utility_model_threshold,
+            utility_model_shadow_decision=report.utility_model_shadow_decision,
+            hard_gate_result=report.hard_gate_result,
+            cache_gate_result=cache_gate_result,
+            mode=report.mode,
+            reason=report.reason,
+            model_name=report.model_name,
+            prompt_safe=report.prompt_safe,
+        )
 
     def _run_semantic_guard(
         self,
@@ -648,3 +815,10 @@ class CacheUtilityValidator:
                 break
             chars += len(blocks_by_id[block_id].rendered_text or "")
         return chars
+
+
+def _normalize_utility_model_mode(value: str) -> str:
+    normalized = str(value or "disabled").strip().lower()
+    if normalized not in {"disabled", "shadow", "gate"}:
+        raise ValueError(f"Unsupported utility_model_mode: {value}")
+    return normalized

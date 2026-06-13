@@ -1,0 +1,61 @@
+{
+  "failure_type_counts": {
+    "baseline": {
+      "code_test_fail": 20,
+      "none": 64,
+      "wrong_tool_call": 16
+    },
+    "ours": {
+      "code_test_fail": 20,
+      "none": 64,
+      "wrong_tool_call": 16
+    }
+  },
+  "overall": {
+    "baseline_success_count": 64,
+    "baseline_success_rate": 0.64,
+    "original_failed_count": 36,
+    "ours_success_count": 64,
+    "ours_success_rate": 0.64,
+    "utility_drop": 0.0,
+    "utility_preservation_rate": 1.0
+  },
+  "per_source": {
+    "format_protocol": {
+      "baseline_success_rate": 1.0,
+      "original_failed_count": 0,
+      "ours_success_rate": 1.0,
+      "utility_drop": 0.0,
+      "utility_preservation_rate": 1.0
+    },
+    "history_state": {
+      "baseline_success_rate": 1.0,
+      "original_failed_count": 0,
+      "ours_success_rate": 1.0,
+      "utility_drop": 0.0,
+      "utility_preservation_rate": 1.0
+    },
+    "humaneval": {
+      "baseline_success_rate": 0.0,
+      "original_failed_count": 20,
+      "ours_success_rate": 0.0,
+      "utility_drop": 0.0,
+      "utility_preservation_rate": 0.0
+    },
+    "role_privacy": {
+      "baseline_success_rate": 0.7,
+      "original_failed_count": 6,
+      "ours_success_rate": 0.7,
+      "utility_drop": 0.0,
+      "utility_preservation_rate": 1.0
+    },
+    "synthetic_agent": {
+      "baseline_success_rate": 0.5,
+      "original_failed_count": 10,
+      "ours_success_rate": 0.5,
+      "utility_drop": 0.0,
+      "utility_preservation_rate": 1.0
+    }
+  },
+  "schema_version": "dspro-utility-report-v1"
+}

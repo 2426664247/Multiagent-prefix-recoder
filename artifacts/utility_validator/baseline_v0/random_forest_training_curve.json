@@ -1,0 +1,85 @@
+{
+  "curve_type": "cumulative_random_forest_ensemble_metrics",
+  "note": "Random Forest has no epoch loss curve; this shows metrics as more fitted trees are included.",
+  "selected_model": "utility_validator_baseline_v0:random_forest_balanced",
+  "selected_threshold": 0.5289255574007625,
+  "rows": [
+    {
+      "n_estimators": 1,
+      "valid_balanced_accuracy": 0.7666666666666666,
+      "valid_negative_recall": 0.8,
+      "valid_false_negative_rate": 0.2,
+      "valid_macro_f1": 0.7150997150997151,
+      "test_balanced_accuracy": 0.7666666666666666,
+      "test_negative_recall": 0.8,
+      "test_false_negative_rate": 0.2,
+      "test_macro_f1": 0.7150997150997151
+    },
+    {
+      "n_estimators": 2,
+      "valid_balanced_accuracy": 0.7666666666666666,
+      "valid_negative_recall": 0.8,
+      "valid_false_negative_rate": 0.2,
+      "valid_macro_f1": 0.7150997150997151,
+      "test_balanced_accuracy": 0.7666666666666666,
+      "test_negative_recall": 0.8,
+      "test_false_negative_rate": 0.2,
+      "test_macro_f1": 0.7150997150997151
+    },
+    {
+      "n_estimators": 5,
+      "valid_balanced_accuracy": 0.8,
+      "valid_negative_recall": 0.8,
+      "valid_false_negative_rate": 0.2,
+      "valid_macro_f1": 0.7619047619047619,
+      "test_balanced_accuracy": 0.8,
+      "test_negative_recall": 0.8,
+      "test_false_negative_rate": 0.2,
+      "test_macro_f1": 0.7619047619047619
+    },
+    {
+      "n_estimators": 10,
+      "valid_balanced_accuracy": 0.7,
+      "valid_negative_recall": 0.6,
+      "valid_false_negative_rate": 0.4,
+      "valid_macro_f1": 0.6865203761755486,
+      "test_balanced_accuracy": 0.7,
+      "test_negative_recall": 0.6,
+      "test_false_negative_rate": 0.4,
+      "test_macro_f1": 0.6865203761755486
+    },
+    {
+      "n_estimators": 20,
+      "valid_balanced_accuracy": 0.7,
+      "valid_negative_recall": 0.6,
+      "valid_false_negative_rate": 0.4,
+      "valid_macro_f1": 0.6865203761755486,
+      "test_balanced_accuracy": 0.7,
+      "test_negative_recall": 0.6,
+      "test_false_negative_rate": 0.4,
+      "test_macro_f1": 0.6865203761755486
+    },
+    {
+      "n_estimators": 40,
+      "valid_balanced_accuracy": 0.8,
+      "valid_negative_recall": 0.8,
+      "valid_false_negative_rate": 0.2,
+      "valid_macro_f1": 0.7619047619047619,
+      "test_balanced_accuracy": 0.7,
+      "test_negative_recall": 0.6,
+      "test_false_negative_rate": 0.4,
+      "test_macro_f1": 0.6865203761755486
+    },
+    {
+      "n_estimators": 80,
+      "valid_balanced_accuracy": 0.9,
+      "valid_negative_recall": 1.0,
+      "valid_false_negative_rate": 0.0,
+      "valid_macro_f1": 0.8290598290598291,
+      "test_balanced_accuracy": 0.8,
+      "test_negative_recall": 0.8,
+      "test_false_negative_rate": 0.2,
+      "test_macro_f1": 0.7619047619047619
+    }
+  ]
+}

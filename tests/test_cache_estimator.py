@@ -16,6 +16,7 @@ from autogen_prefix_tree import (
     PrefixTreeEstimator,
     build_replay_run_record,
     rewrite_messages,
+    UtilityPreservationReport,
 )
 from autogen_prefix_tree.cache_estimator_smoke import run_smoke
 from autogen_prefix_tree.static_client import StaticResponseClient
@@ -38,6 +39,28 @@ class FixedCacheEstimator:
         del original_requests, rewritten_requests, candidate, context
         self.calls += 1
         return self.report
+
+
+class FixedUtilityModelValidator:
+    threshold = 0.6
+    model_name = "fixed-utility-model"
+
+    def __init__(self, *, prediction: bool | None, confidence: float) -> None:
+        self.prediction = prediction
+        self.confidence = confidence
+        self.calls = 0
+
+    def evaluate(self, **_: Any) -> UtilityPreservationReport:
+        self.calls += 1
+        return UtilityPreservationReport(
+            is_utility_preserved=self.prediction,
+            confidence=self.confidence,
+            reason="fixed_structured_shadow_prediction",
+            checks=("structured_features_only",),
+            model_name=self.model_name,
+            prompt_safe=True,
+            utility_status="passed" if self.prediction is True else "failed" if self.prediction is False else "unverified",
+        )
 
 
 def test_prefix_tree_estimator_outputs_unified_report() -> None:
@@ -212,6 +235,131 @@ def test_replay_records_cache_estimate_without_prompt_text() -> None:
     serialized = json.dumps(replay, ensure_ascii=False)
     assert "AGENT_NAME: engineer" not in serialized
     assert "Shared estimator context." not in serialized
+
+
+def test_utility_model_shadow_records_fields_without_changing_default_decision() -> None:
+    warm, plan = _warm_plan(session_id="utility-model-shadow")
+    rewritten_messages = rewrite_messages(warm, plan)
+    default_report = CacheUtilityValidator().validate(
+        original_messages=warm.messages,
+        rewritten_messages=rewritten_messages,
+        compile_result=warm,
+        plan=plan,
+    )
+    utility_model = FixedUtilityModelValidator(prediction=False, confidence=0.91)
+    shadow_report = CacheUtilityValidator(
+        utility_model_validator=utility_model,
+        utility_model_mode="shadow",
+        utility_model_min_confidence=0.6,
+    ).validate(
+        original_messages=warm.messages,
+        rewritten_messages=rewritten_messages,
+        compile_result=warm,
+        plan=plan,
+    )
+
+    assert utility_model.calls == 1
+    assert (shadow_report.applied, shadow_report.fallback, shadow_report.reason) == (
+        default_report.applied,
+        default_report.fallback,
+        default_report.reason,
+    )
+    assert shadow_report.utility_model_gate_report is not None
+    gate = shadow_report.utility_model_gate_report
+    assert gate.utility_model_prediction is False
+    assert gate.utility_model_confidence == 0.91
+    assert gate.utility_model_threshold == 0.6
+    assert gate.utility_model_shadow_decision == "would_reject"
+    assert gate.hard_gate_result == "passed"
+    assert gate.cache_gate_result == "passed"
+
+    replay = build_replay_run_record(
+        run_id="utility-model-shadow",
+        compile_result=warm,
+        plan=plan,
+        validation_report=shadow_report,
+        candidates=(plan.prefix_tree_candidate,) if plan.prefix_tree_candidate is not None else (),
+        final_decision="applied" if shadow_report.applied else "fallback",
+        include_text=False,
+    )
+    for key in (
+        "utility_model_prediction",
+        "utility_model_confidence",
+        "utility_model_threshold",
+        "utility_model_shadow_decision",
+        "hard_gate_result",
+        "cache_gate_result",
+    ):
+        assert key in replay
+    assert replay["utility_model_shadow_decision"] == "would_reject"
+    serialized = json.dumps(replay, ensure_ascii=False)
+    assert "AGENT_NAME: engineer" not in serialized
+    assert "Shared estimator context." not in serialized
+
+
+def test_utility_model_shadow_telemetry_records_fields_without_prompt_text() -> None:
+    records: list[dict[str, Any]] = []
+    utility_model = FixedUtilityModelValidator(prediction=True, confidence=0.88)
+    client = PrefixReorderClient(
+        StaticResponseClient(responses=("OK", "OK")),
+        session_id="utility-model-telemetry",
+        validator=CacheUtilityValidator(
+            utility_model_validator=utility_model,
+            utility_model_mode="shadow",
+            utility_model_min_confidence=0.6,
+        ),
+        telemetry_sink=records.append,
+    )
+
+    import asyncio
+
+    asyncio.run(client.create(_messages("planner")))
+    asyncio.run(client.create(_messages("engineer")))
+
+    telemetry = records[-1]
+    assert telemetry["utility_model_prediction"] is True
+    assert telemetry["utility_model_confidence"] == 0.88
+    assert telemetry["utility_model_threshold"] == 0.6
+    assert telemetry["utility_model_shadow_decision"] == "would_accept"
+    assert telemetry["hard_gate_result"] == "passed"
+    assert telemetry["cache_gate_result"] == "passed"
+    assert telemetry["utility_model_gate"]["mode"] == "shadow"
+    serialized = json.dumps(telemetry, ensure_ascii=False)
+    assert "AGENT_NAME: engineer" not in serialized
+    assert "Shared estimator context." not in serialized
+
+
+def test_low_confidence_utility_model_observes_and_gate_does_not_block() -> None:
+    warm, plan = _warm_plan(session_id="utility-model-observe")
+    rewritten_messages = rewrite_messages(warm, plan)
+    default_report = CacheUtilityValidator().validate(
+        original_messages=warm.messages,
+        rewritten_messages=rewritten_messages,
+        compile_result=warm,
+        plan=plan,
+    )
+    utility_model = FixedUtilityModelValidator(prediction=False, confidence=0.51)
+
+    gate_report = CacheUtilityValidator(
+        utility_model_validator=utility_model,
+        utility_model_mode="gate",
+        utility_model_min_confidence=0.8,
+    ).validate(
+        original_messages=warm.messages,
+        rewritten_messages=rewritten_messages,
+        compile_result=warm,
+        plan=plan,
+    )
+
+    assert utility_model.calls == 1
+    assert (gate_report.applied, gate_report.fallback, gate_report.reason) == (
+        default_report.applied,
+        default_report.fallback,
+        default_report.reason,
+    )
+    assert gate_report.utility_model_gate_report is not None
+    assert gate_report.utility_model_gate_report.utility_model_shadow_decision == "observe"
+    assert gate_report.utility_model_gate_report.cache_gate_result == "passed"
 
 
 def test_cache_estimator_smoke_cli_summary_prefix_tree(tmp_path: Path) -> None:

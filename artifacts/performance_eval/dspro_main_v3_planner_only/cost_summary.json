@@ -1,0 +1,31 @@
+{
+  "api_call_count": 200,
+  "api_key_stored": false,
+  "base_url": "https://api.deepseek.com/v1",
+  "config_source": "config/config.txt",
+  "estimated_cost_usd": 0.31750476,
+  "input_token_target_max": 500000,
+  "input_token_target_min": 100000,
+  "latency_seconds_avg": 2.5322996045001127,
+  "latency_seconds_total": 506.45992090002255,
+  "max_api_calls": 240,
+  "model": "deepseek-v4-pro",
+  "model_is_flash": false,
+  "model_is_pro": true,
+  "price_cached_input_per_million": 0.174,
+  "price_input_per_million": 1.74,
+  "price_output_per_million": 3.48,
+  "prompt_budget_estimate": {
+    "baseline_prompt_chars": 217216,
+    "estimate_method": "prompt_chars_div_3.6_before_provider_tokenization",
+    "estimated_total_input_tokens": 120676,
+    "optimized_prompt_chars_floor": 217216
+  },
+  "provider": "deepseek",
+  "provider_cost_usd": 0.0,
+  "total_cache_miss_tokens": 124910,
+  "total_cached_tokens": 0,
+  "total_input_tokens": 124910,
+  "total_output_tokens": 28782,
+  "total_tokens": 153692
+}

@@ -341,6 +341,7 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             for block_id in (plan.moved_blocks if plan else ())
             if block_id in blocks_by_id
         )
+        utility_model_gate = dataclass_to_dict(report.utility_model_gate_report) or {}
         return {
             "schema_version": "prefix-reorder-telemetry-v1",
             "session_id": self.session_id,
@@ -372,6 +373,19 @@ class PrefixReorderClient(ChatCompletionClient, Component[PrefixReorderClientCon
             },
             "hard_constraint_passed": report.hard_constraint_passed,
             "hard_constraint_report": report.hard_constraint_report,
+            "hard_gate_result": utility_model_gate.get(
+                "hard_gate_result",
+                "passed" if report.hard_constraint_passed else "failed",
+            ),
+            "cache_gate_result": utility_model_gate.get(
+                "cache_gate_result",
+                "passed" if report.cache_hit_increased else "failed" if report.cache_hit_increased is False else "not_run",
+            ),
+            "utility_model_prediction": utility_model_gate.get("utility_model_prediction"),
+            "utility_model_confidence": utility_model_gate.get("utility_model_confidence"),
+            "utility_model_threshold": utility_model_gate.get("utility_model_threshold"),
+            "utility_model_shadow_decision": utility_model_gate.get("utility_model_shadow_decision"),
+            "utility_model_gate": utility_model_gate,
             "utility_status": report.utility_status,
             "cache_hit_increased": report.cache_hit_increased,
             "cache_estimate_report": dataclass_to_dict(report.cache_estimate_report),

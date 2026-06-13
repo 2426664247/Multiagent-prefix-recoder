@@ -1,0 +1,46 @@
+{
+  "overall": {
+    "baseline_cache_hit_rate": 0.0,
+    "cache_hit_rate_lift": 0.0,
+    "cache_hit_rate_lift_percentage_points": 0.0,
+    "ours_cache_hit_rate": 0.0
+  },
+  "per_source": {
+    "format_protocol": {
+      "baseline_cache_hit_rate": 0.0,
+      "baseline_cached_tokens": 0,
+      "cache_hit_rate_lift": 0.0,
+      "ours_cache_hit_rate": 0.0,
+      "ours_cached_tokens": 0
+    },
+    "history_state": {
+      "baseline_cache_hit_rate": 0.0,
+      "baseline_cached_tokens": 0,
+      "cache_hit_rate_lift": 0.0,
+      "ours_cache_hit_rate": 0.0,
+      "ours_cached_tokens": 0
+    },
+    "humaneval": {
+      "baseline_cache_hit_rate": 0.0,
+      "baseline_cached_tokens": 0,
+      "cache_hit_rate_lift": 0.0,
+      "ours_cache_hit_rate": 0.0,
+      "ours_cached_tokens": 0
+    },
+    "role_privacy": {
+      "baseline_cache_hit_rate": 0.0,
+      "baseline_cached_tokens": 0,
+      "cache_hit_rate_lift": 0.0,
+      "ours_cache_hit_rate": 0.0,
+      "ours_cached_tokens": 0
+    },
+    "synthetic_agent": {
+      "baseline_cache_hit_rate": 0.0,
+      "baseline_cached_tokens": 0,
+      "cache_hit_rate_lift": 0.0,
+      "ours_cache_hit_rate": 0.0,
+      "ours_cached_tokens": 0
+    }
+  },
+  "schema_version": "dspro-cache-report-v1"
+}

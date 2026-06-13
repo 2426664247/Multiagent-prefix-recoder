@@ -1,0 +1,60 @@
+{
+  "api_call_count": 12,
+  "baseline_cached_tokens": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "baseline_input_tokens": [
+    866,
+    846,
+    782,
+    791,
+    827,
+    806
+  ],
+  "baseline_success_count": 0,
+  "cache_isolation_tag": "planner-only-smoke-20260614-v1",
+  "comparison": {
+    "baseline_cache_hit_rate": 0.0,
+    "baseline_success_count": 0,
+    "baseline_success_rate": 0.0,
+    "cache_hit_rate_lift": 0.0,
+    "cache_hit_rate_lift_percentage_points": 0.0,
+    "original_failed_count": 6,
+    "ours_cache_hit_rate": 0.0,
+    "ours_success_count": 0,
+    "ours_success_rate": 0.0,
+    "paired_task_count": 6,
+    "utility_drop": 0.0,
+    "utility_preservation_rate": 0.0
+  },
+  "created_at": "2026-06-13T17:43:39Z",
+  "force_front_loaded_common_prefix": false,
+  "model": "deepseek-v4-pro",
+  "optimized_cached_tokens": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "optimized_input_tokens": [
+    866,
+    846,
+    782,
+    791,
+    827,
+    806
+  ],
+  "optimized_success_count": 0,
+  "schema_version": "dspro-planner-only-smoke-v1",
+  "source_counts": {
+    "humaneval": 6
+  },
+  "task_count": 6
+}

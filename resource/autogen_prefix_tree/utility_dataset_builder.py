@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -15,7 +16,7 @@ from typing import Any, Mapping, Sequence
 from autogen_core.models import SystemMessage, UserMessage
 
 from .compiler import LocalPromptCompiler
-from .ir import stable_hash
+from .ir import Movability, SemanticType, ShareScope, stable_hash
 from .planner import HierarchicalPrefixPlanner, rewrite_messages
 from .project_api_config import load_project_provider_config, normalize_deepseek_model
 from .telemetry import dataclass_to_dict, serialize_prefix_tree_candidate
@@ -34,7 +35,32 @@ class UtilityDatasetBuildResult:
     summary: Mapping[str, Any]
 
 
-REAL_DATASET_MODES = {"smoke_real", "pilot_real"}
+@dataclass(frozen=True)
+class FullUtilityDatasetBuildResult:
+    output_root: str
+    summary_path: str
+    cost_summary_path: str
+    quality_report_path: str
+    dataset_card_path: str
+    training_usage_path: str
+    summary: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ExpandedUtilityDatasetBuildResult:
+    output_root: str
+    summary_path: str
+    cost_summary_path: str
+    quality_report_path: str
+    dataset_card_path: str
+    training_usage_path: str
+    summary: Mapping[str, Any]
+
+
+REAL_DATASET_MODES = {"smoke_real", "pilot_real", "train_real", "expanded_real"}
+FINAL_SPLITS = ("train", "valid", "test")
+EXPANDED_SPLITS = ("expanded_train", "expanded_valid", "expanded_test")
+EXPANDED_STRATEGIES = ("conservative", "balanced", "aggressive", "adversarial")
 
 
 class FakeModelBackend:
@@ -304,8 +330,60 @@ def build_utility_validator_smoke_dataset(
     model: str | None = None,
     created_at: str | None = None,
 ) -> UtilityDatasetBuildResult:
+    if mode == "expanded_real":
+        result = build_expanded_utility_validator_dataset(
+            repo_root=repo_root,
+            output_root=output_root,
+            source=source,
+            backend=backend,
+            max_tasks=max_tasks,
+            include_text=include_text,
+            max_api_calls=max_api_calls,
+            confirm_cost_aware=confirm_cost_aware,
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+            price_input_per_million=price_input_per_million,
+            price_output_per_million=price_output_per_million,
+            project_config_path=project_config_path,
+            model=model,
+            created_at=created_at,
+        )
+        return UtilityDatasetBuildResult(
+            output_root=result.output_root,
+            task_path="",
+            label_path="",
+            feature_path="",
+            summary_path=result.summary_path,
+            summary=result.summary,
+        )
+    if mode == "train_real":
+        result = build_full_utility_validator_dataset(
+            repo_root=repo_root,
+            output_root=output_root,
+            source=source,
+            backend=backend,
+            max_tasks=max_tasks,
+            include_text=include_text,
+            max_api_calls=max_api_calls,
+            confirm_cost_aware=confirm_cost_aware,
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+            price_input_per_million=price_input_per_million,
+            price_output_per_million=price_output_per_million,
+            project_config_path=project_config_path,
+            model=model,
+            created_at=created_at,
+        )
+        return UtilityDatasetBuildResult(
+            output_root=result.output_root,
+            task_path="",
+            label_path="",
+            feature_path="",
+            summary_path=result.summary_path,
+            summary=result.summary,
+        )
     if mode not in {"smoke", "smoke_real", "pilot_real"}:
-        raise ValueError("only smoke, smoke_real, and pilot_real modes are implemented in the dataset builder")
+        raise ValueError("only smoke, smoke_real, pilot_real, train_real, and expanded_real modes are implemented in the dataset builder")
     if backend == "fake" and mode in REAL_DATASET_MODES:
         raise ValueError(f"{mode} requires --backend dsapi")
     if backend == "fake":
@@ -419,6 +497,416 @@ def build_utility_validator_smoke_dataset(
     )
 
 
+def build_full_utility_validator_dataset(
+    *,
+    repo_root: str | Path = ".",
+    output_root: str | Path = "datasets/utility_validator",
+    source: str = "all",
+    backend: str = "dsapi",
+    max_tasks: int = 50,
+    include_text: bool = False,
+    max_api_calls: int | None = None,
+    confirm_cost_aware: bool = False,
+    max_output_tokens: int = 128,
+    timeout_seconds: float = 120.0,
+    price_input_per_million: float | None = None,
+    price_output_per_million: float | None = None,
+    project_config_path: str | Path | None = None,
+    model: str | None = None,
+    batch_size: int = 25,
+    checkpoint_api_calls: int = 100,
+    max_estimated_cost_usd: float = 1.0,
+    created_at: str | None = None,
+) -> FullUtilityDatasetBuildResult:
+    if backend != "dsapi":
+        raise ValueError("train_real requires --backend dsapi")
+    if not confirm_cost_aware or max_api_calls is None or max_api_calls <= 0:
+        raise ValueError("train_real requires --max-api-calls N --confirm-cost-aware")
+    if include_text:
+        raise ValueError("train_real refuses --include-text by default for prompt-safe training data")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if checkpoint_api_calls <= 0:
+        raise ValueError("--checkpoint-api-calls must be positive")
+    if max_tasks <= 0:
+        raise ValueError("--max-tasks must be positive")
+
+    timestamp = created_at or datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    root = Path(repo_root)
+    output = Path(output_root)
+    ensure_utility_dataset_layout(root)
+    full_paths = _full_output_paths(output)
+    _prepare_full_output_dirs(full_paths)
+    checkpoint_root = output / "reports" / "full_checkpoints"
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    backend_impl = DsApiBackend(
+        repo_root=repo_root,
+        max_api_calls=max_api_calls,
+        confirm_cost_aware=confirm_cost_aware,
+        max_output_tokens=max_output_tokens,
+        timeout_seconds=timeout_seconds,
+        price_input_per_million=price_input_per_million,
+        price_output_per_million=price_output_per_million,
+        config_path=project_config_path,
+        model_override=model,
+    )
+    if backend_impl.model_name != "deepseek-v4-flash":
+        raise ValueError(
+            f"train_real requires exact model deepseek-v4-flash; effective model is {backend_impl.model_name!r}"
+        )
+
+    source_result = build_utility_smoke_tasks(
+        repo_root=root,
+        source=source,
+        max_tasks=None,
+        include_text=False,
+        created_at=timestamp,
+    )
+    base_tasks = _prepare_tasks_for_mode(source_result.tasks, source=source, mode="pilot_real", max_tasks=max_tasks)
+    batches = _batch_tasks(base_tasks, batch_size=batch_size)
+    all_tasks: list[dict[str, Any]] = []
+    all_labels: list[dict[str, Any]] = []
+    all_features: list[dict[str, Any]] = []
+    checkpoint_reports: list[dict[str, Any]] = []
+    anomalous_batches: list[Mapping[str, Any]] = []
+    total_cost_at_last_checkpoint = 0.0
+    started_at = time.perf_counter()
+
+    runner = UtilityLabelRunner(backend=backend_impl)
+    for batch_index, batch_tasks in enumerate(batches, start=1):
+        calls_before = backend_impl.calls_made
+        cost_before = backend_impl.cost_summary()
+        rows = runner.run(tasks=batch_tasks, include_text=False, created_at=timestamp)
+        labels = tuple(row["label"] for row in rows)
+        features = tuple(row["feature"] for row in rows if row["label"].get("is_utility_preserved") in {True, False})
+        tasks = tuple(_strip_private_task_fields(task) for task in batch_tasks[: len(rows)])
+        cost_after = backend_impl.cost_summary()
+        checkpoint_report = _checkpoint_report(
+            batch_index=batch_index,
+            tasks=tasks,
+            labels=labels,
+            features=features,
+            cost_before=cost_before,
+            cost_after=cost_after,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+            max_api_calls=max_api_calls,
+            checkpoint_api_calls=checkpoint_api_calls,
+            output_root=output,
+            created_at=timestamp,
+        )
+        batch_dir = checkpoint_root / f"batch_{batch_index:04d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(batch_dir / "utility_tasks.jsonl", tasks)
+        _write_jsonl(batch_dir / "utility_labels.jsonl", labels)
+        _write_jsonl(batch_dir / "training_features.jsonl", features)
+        _write_json(batch_dir / "checkpoint_report.json", checkpoint_report)
+        checkpoint_reports.append(checkpoint_report)
+        if not checkpoint_report["passed"]:
+            anomalous_batches.append(
+                {
+                    "batch_index": batch_index,
+                    "report_path": str(batch_dir / "checkpoint_report.json"),
+                    "blockers": checkpoint_report["blockers"],
+                    "handled": "paused_before_merge",
+                }
+            )
+            break
+        all_tasks.extend(dict(task) for task in tasks)
+        all_labels.extend(dict(label) for label in labels)
+        all_features.extend(dict(feature) for feature in features)
+        total_cost_at_last_checkpoint = float(cost_after.get("estimated_cost_usd") or 0.0)
+        if backend_impl.calls_made >= max_api_calls:
+            break
+        if backend_impl.calls_made == calls_before and rows:
+            raise RuntimeError("checkpoint made no API-call progress despite emitted rows")
+
+    split_rows = _split_full_rows(all_tasks, all_labels, all_features)
+    _write_split_outputs(full_paths, split_rows)
+    cost_summary = _full_cost_summary(backend_impl.cost_summary())
+    quality_report = _full_quality_report(
+        split_rows=split_rows,
+        checkpoint_reports=checkpoint_reports,
+        anomalous_batches=anomalous_batches,
+        output_root=output,
+        created_at=timestamp,
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+    full_summary = _full_build_summary(
+        source=source,
+        max_tasks=max_tasks,
+        batch_size=batch_size,
+        checkpoint_api_calls=checkpoint_api_calls,
+        max_api_calls=max_api_calls,
+        include_text=include_text,
+        created_at=timestamp,
+        elapsed_seconds=elapsed_seconds,
+        split_rows=split_rows,
+        cost_summary=cost_summary,
+        quality_report=quality_report,
+        checkpoint_reports=checkpoint_reports,
+        anomalous_batches=anomalous_batches,
+        output_paths=full_paths,
+        source_reports=source_result.source_reports,
+        total_cost_at_last_checkpoint=total_cost_at_last_checkpoint,
+    )
+    _write_json(full_paths["reports"]["cost_summary"], cost_summary)
+    _write_json(full_paths["reports"]["quality_report"], quality_report)
+    _write_json(full_paths["reports"]["full_build_summary"], full_summary)
+    _write_text(full_paths["reports"]["dataset_card"], _dataset_card_markdown(full_summary))
+    _write_text(full_paths["reports"]["training_usage"], _training_usage_markdown(full_summary))
+    return FullUtilityDatasetBuildResult(
+        output_root=str(output),
+        summary_path=str(full_paths["reports"]["full_build_summary"]),
+        cost_summary_path=str(full_paths["reports"]["cost_summary"]),
+        quality_report_path=str(full_paths["reports"]["quality_report"]),
+        dataset_card_path=str(full_paths["reports"]["dataset_card"]),
+        training_usage_path=str(full_paths["reports"]["training_usage"]),
+        summary=full_summary,
+    )
+
+
+def build_expanded_utility_validator_dataset(
+    *,
+    repo_root: str | Path = ".",
+    output_root: str | Path = "datasets/utility_validator",
+    source: str = "all",
+    backend: str = "dsapi",
+    max_tasks: int = 160,
+    include_text: bool = False,
+    max_api_calls: int | None = None,
+    confirm_cost_aware: bool = False,
+    max_output_tokens: int = 128,
+    timeout_seconds: float = 120.0,
+    price_input_per_million: float | None = None,
+    price_output_per_million: float | None = None,
+    project_config_path: str | Path | None = None,
+    model: str | None = None,
+    batch_size: int = 50,
+    checkpoint_api_calls: int = 100,
+    max_estimated_cost_usd: float = 1.0,
+    target_true_count: int = 150,
+    target_false_count: int = 50,
+    created_at: str | None = None,
+) -> ExpandedUtilityDatasetBuildResult:
+    if backend != "dsapi":
+        raise ValueError("expanded_real requires --backend dsapi")
+    if not confirm_cost_aware or max_api_calls is None or max_api_calls <= 0:
+        raise ValueError("expanded_real requires --max-api-calls N --confirm-cost-aware")
+    if include_text:
+        raise ValueError("expanded_real refuses --include-text by default for prompt-safe training data")
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if checkpoint_api_calls <= 0:
+        raise ValueError("--checkpoint-api-calls must be positive")
+
+    timestamp = created_at or datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    root = Path(repo_root)
+    output = Path(output_root)
+    ensure_utility_dataset_layout(root)
+    paths = _expanded_output_paths(output)
+    _prepare_full_output_dirs(paths)
+    checkpoint_root = output / "reports" / "expanded_checkpoints"
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    backend_impl = DsApiBackend(
+        repo_root=repo_root,
+        max_api_calls=max_api_calls,
+        confirm_cost_aware=confirm_cost_aware,
+        max_output_tokens=max_output_tokens,
+        timeout_seconds=timeout_seconds,
+        price_input_per_million=price_input_per_million,
+        price_output_per_million=price_output_per_million,
+        config_path=project_config_path,
+        model_override=model,
+    )
+    if backend_impl.model_name != "deepseek-v4-flash":
+        raise ValueError(
+            f"expanded_real requires exact model deepseek-v4-flash; effective model is {backend_impl.model_name!r}"
+        )
+
+    seed_rows = _load_existing_full_rows(output)
+    seed_tasks = list(seed_rows["tasks"])
+    seed_labels = list(seed_rows["labels"])
+    seed_features = list(seed_rows["features"])
+    seed_label_keys = {_label_dedupe_key(label) for label in seed_labels}
+
+    source_result = build_utility_smoke_tasks(
+        repo_root=root,
+        source=source,
+        max_tasks=None,
+        include_text=False,
+        created_at=timestamp,
+    )
+    base_tasks = _prepare_tasks_for_mode(source_result.tasks, source=source, mode="pilot_real", max_tasks=max_tasks)
+    expanded_tasks = tuple(_mark_expanded_task(task) for task in base_tasks)
+    batches = _batch_tasks(expanded_tasks, batch_size=batch_size)
+    new_tasks: list[dict[str, Any]] = []
+    new_labels: list[dict[str, Any]] = []
+    new_features: list[dict[str, Any]] = []
+    checkpoint_reports: list[dict[str, Any]] = []
+    anomalous_batches: list[Mapping[str, Any]] = []
+    total_cost_at_last_checkpoint = 0.0
+    started_at = time.perf_counter()
+
+    runner = UtilityLabelRunner(backend=backend_impl)
+    for batch_index, batch_tasks in enumerate(batches, start=1):
+        calls_before = backend_impl.calls_made
+        cost_before = backend_impl.cost_summary()
+        current_counts = _preserved_counts(seed_labels + new_labels)
+        remaining_trainable = max(0, (target_true_count + target_false_count) - (current_counts["true"] + current_counts["false"]))
+        remaining_false = max(0, target_false_count - current_counts["false"])
+        rows = runner.run_candidates(
+            tasks=batch_tasks,
+            include_text=False,
+            created_at=timestamp,
+            strategies=EXPANDED_STRATEGIES,
+            start_index=len(seed_labels) + len(new_labels) + 1,
+            stop_after_trainable=max(remaining_trainable, 0) if remaining_trainable else None,
+            target_false_count=remaining_false if remaining_false else None,
+            max_api_call_delta=checkpoint_api_calls,
+        )
+        deduped_rows = tuple(row for row in rows if _label_dedupe_key(row["label"]) not in seed_label_keys)
+        for row in deduped_rows:
+            seed_label_keys.add(_label_dedupe_key(row["label"]))
+        labels = tuple(row["label"] for row in deduped_rows)
+        features = tuple(row["feature"] for row in deduped_rows if row["label"].get("is_utility_preserved") in {True, False})
+        tasks = tuple(_strip_private_task_fields(row["task"]) for row in deduped_rows)
+        cost_after = backend_impl.cost_summary()
+        checkpoint_report = _checkpoint_report(
+            batch_index=batch_index,
+            tasks=tasks,
+            labels=labels,
+            features=features,
+            cost_before=cost_before,
+            cost_after=cost_after,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+            max_api_calls=max_api_calls,
+            checkpoint_api_calls=checkpoint_api_calls,
+            output_root=output,
+            created_at=timestamp,
+            scan_splits=EXPANDED_SPLITS,
+            report_names=_expanded_report_file_names(),
+        )
+        batch_dir = checkpoint_root / f"batch_{batch_index:04d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(batch_dir / "utility_tasks.jsonl", tasks)
+        _write_jsonl(batch_dir / "utility_labels.jsonl", labels)
+        _write_jsonl(batch_dir / "training_features.jsonl", features)
+        _write_json(batch_dir / "checkpoint_report.json", checkpoint_report)
+        checkpoint_reports.append(checkpoint_report)
+        if not checkpoint_report["passed"]:
+            anomalous_batches.append(
+                {
+                    "batch_index": batch_index,
+                    "report_path": str(batch_dir / "checkpoint_report.json"),
+                    "blockers": checkpoint_report["blockers"],
+                    "handled": "paused_before_merge",
+                }
+            )
+            break
+        new_tasks.extend(dict(task) for task in tasks)
+        new_labels.extend(dict(label) for label in labels)
+        new_features.extend(dict(feature) for feature in features)
+        total_cost_at_last_checkpoint = float(cost_after.get("estimated_cost_usd") or 0.0)
+        merged_counts = _preserved_counts(seed_labels + new_labels)
+        if (merged_counts["true"] + merged_counts["false"]) >= target_true_count + target_false_count and merged_counts["false"] >= target_false_count:
+            break
+        if backend_impl.calls_made >= max_api_calls:
+            break
+        if backend_impl.calls_made == calls_before and rows:
+            raise RuntimeError("expanded checkpoint made no API-call progress despite emitted rows")
+
+    raw_new_label_count = len(new_labels)
+    raw_new_feature_count = len(new_features)
+    raw_new_task_count = len(new_tasks)
+    selected_rows = _select_expanded_rows(
+        tasks=seed_tasks + new_tasks,
+        labels=seed_labels + new_labels,
+        features=seed_features + new_features,
+        target_true_count=target_true_count,
+        target_false_count=target_false_count,
+        seed_label_ids={str(label.get("label_id") or "") for label in seed_labels},
+        seed_feature_label_ids={str(feature.get("label_id") or "") for feature in seed_features},
+    )
+    all_tasks = list(selected_rows["tasks"])
+    all_labels = list(selected_rows["labels"])
+    all_features = list(selected_rows["features"])
+    selection_report = selected_rows["selection_report"]
+    split_rows = _split_full_rows(all_tasks, all_labels, all_features, split_names=EXPANDED_SPLITS)
+    _write_split_outputs(paths, split_rows)
+    cost_summary = _full_cost_summary(backend_impl.cost_summary())
+    quality_report = _full_quality_report(
+        split_rows=split_rows,
+        checkpoint_reports=checkpoint_reports,
+        anomalous_batches=anomalous_batches,
+        output_root=output,
+        created_at=timestamp,
+        split_names=EXPANDED_SPLITS,
+        scan_report_names=_expanded_report_file_names(),
+        schema_version="utility-validator-expanded-quality-report-v1",
+    )
+    elapsed_seconds = time.perf_counter() - started_at
+    final_counts = _preserved_counts(all_labels)
+    extra_fields = {
+        "seed_label_count": len(seed_labels),
+        "seed_feature_count": len(seed_features),
+        "raw_new_task_count": raw_new_task_count,
+        "raw_new_label_count": raw_new_label_count,
+        "raw_new_feature_count": raw_new_feature_count,
+        "new_label_count": selection_report.get("selected_new_label_count"),
+        "new_feature_count": selection_report.get("selected_new_feature_count"),
+        "target_selection_report": selection_report,
+        "target_true_count": target_true_count,
+        "target_false_count": target_false_count,
+        "target_trainable_count": target_true_count + target_false_count,
+        "target_reached": (
+            final_counts["true"] >= target_true_count
+            and final_counts["false"] >= target_false_count
+            and final_counts["true"] + final_counts["false"] >= target_true_count + target_false_count
+        ),
+        "candidate_strategies": EXPANDED_STRATEGIES,
+        "candidate_strategy_false_counts": quality_report.get("candidate_strategy_false_counts"),
+    }
+    summary = _full_build_summary(
+        source=source,
+        max_tasks=max_tasks,
+        batch_size=batch_size,
+        checkpoint_api_calls=checkpoint_api_calls,
+        max_api_calls=max_api_calls,
+        include_text=include_text,
+        created_at=timestamp,
+        elapsed_seconds=elapsed_seconds,
+        split_rows=split_rows,
+        cost_summary=cost_summary,
+        quality_report=quality_report,
+        checkpoint_reports=checkpoint_reports,
+        anomalous_batches=anomalous_batches,
+        output_paths=paths,
+        source_reports=source_result.source_reports,
+        total_cost_at_last_checkpoint=total_cost_at_last_checkpoint,
+        split_names=EXPANDED_SPLITS,
+        mode="expanded_real",
+        schema_version="utility-validator-expanded-build-summary-v1",
+        extra_fields=extra_fields,
+        exception_policy="anomalous batches are written under reports/expanded_checkpoints and not merged",
+    )
+    _write_json(paths["reports"]["cost_summary"], cost_summary)
+    _write_json(paths["reports"]["quality_report"], quality_report)
+    _write_json(paths["reports"]["full_build_summary"], summary)
+    _write_text(paths["reports"]["dataset_card"], _dataset_card_markdown(summary))
+    _write_text(paths["reports"]["training_usage"], _training_usage_markdown(summary))
+    return ExpandedUtilityDatasetBuildResult(
+        output_root=str(output),
+        summary_path=str(paths["reports"]["full_build_summary"]),
+        cost_summary_path=str(paths["reports"]["cost_summary"]),
+        quality_report_path=str(paths["reports"]["quality_report"]),
+        dataset_card_path=str(paths["reports"]["dataset_card"]),
+        training_usage_path=str(paths["reports"]["training_usage"]),
+        summary=summary,
+    )
+
+
 class UtilityLabelRunner:
     def __init__(
         self,
@@ -447,6 +935,58 @@ class UtilityLabelRunner:
             rows.append(self._run_one(task=task, include_text=include_text, created_at=created_at, index=index))
         return tuple(rows)
 
+    def run_candidates(
+        self,
+        *,
+        tasks: Sequence[Mapping[str, Any]],
+        include_text: bool,
+        created_at: str,
+        strategies: Sequence[str] = EXPANDED_STRATEGIES,
+        start_index: int = 1,
+        stop_after_trainable: int | None = None,
+        target_false_count: int | None = None,
+        max_api_call_delta: int | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        rows: list[dict[str, Any]] = []
+        trainable_count = 0
+        false_count = 0
+        calls_start = self.backend.calls_made if self.backend.name == "dsapi" else 0
+        for task in tasks:
+            if self.backend.name == "dsapi" and self.backend.remaining_calls() <= 0:
+                break
+            if (
+                self.backend.name == "dsapi"
+                and max_api_call_delta is not None
+                and self.backend.calls_made - calls_start >= max_api_call_delta
+            ):
+                break
+            for row in self._run_task_candidates(
+                task=task,
+                include_text=include_text,
+                created_at=created_at,
+                start_index=start_index + len(rows),
+                strategies=strategies,
+                calls_start=calls_start,
+                max_api_call_delta=max_api_call_delta,
+            ):
+                rows.append(row)
+                if row["label"].get("is_utility_preserved") in {True, False}:
+                    trainable_count += 1
+                if row["label"].get("is_utility_preserved") is False:
+                    false_count += 1
+                if stop_after_trainable is not None and trainable_count >= stop_after_trainable:
+                    if target_false_count is None or false_count >= target_false_count:
+                        return tuple(rows)
+                if self.backend.name == "dsapi" and self.backend.remaining_calls() <= 0:
+                    return tuple(rows)
+                if (
+                    self.backend.name == "dsapi"
+                    and max_api_call_delta is not None
+                    and self.backend.calls_made - calls_start >= max_api_call_delta
+                ):
+                    return tuple(rows)
+        return tuple(rows)
+
     def _run_one(
         self,
         *,
@@ -459,6 +999,103 @@ class UtilityLabelRunner:
         session_id = f"utility-dataset-smoke:{task.get('dataset_source')}"
         compile_result = self.compiler.compile(messages, session_id=session_id)
         plan = self.planner.plan(compile_result, session_id=session_id)
+        return self._run_candidate_label(
+            task=task,
+            include_text=include_text,
+            created_at=created_at,
+            index=index,
+            compile_result=compile_result,
+            plan=plan,
+            original_output=None,
+            original_trace=None,
+            original_result=None,
+        )
+
+    def _run_task_candidates(
+        self,
+        *,
+        task: Mapping[str, Any],
+        include_text: bool,
+        created_at: str,
+        start_index: int,
+        strategies: Sequence[str],
+        calls_start: int = 0,
+        max_api_call_delta: int | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        messages = _messages_for_task(task)
+        session_id = f"utility-dataset-expanded:{task.get('dataset_source')}"
+        compile_result = self.compiler.compile(messages, session_id=session_id)
+        candidates = _expanded_candidates_for_task(
+            planner=self.planner,
+            compile_result=compile_result,
+            session_id=session_id,
+            strategies=strategies,
+        )
+        rows: list[dict[str, Any]] = []
+        original_output: Any = None
+        original_trace: Any = None
+        original_result: OracleResult | None = None
+        for offset, candidate in enumerate(candidates):
+            if self.backend.name == "dsapi" and self.backend.remaining_calls() <= 0:
+                break
+            if (
+                self.backend.name == "dsapi"
+                and max_api_call_delta is not None
+                and self.backend.calls_made - calls_start >= max_api_call_delta
+            ):
+                break
+            if (
+                self.backend.name == "dsapi"
+                and max_api_call_delta is not None
+                and original_result is None
+                and self.backend.calls_made - calls_start >= max_api_call_delta - 1
+            ):
+                break
+            if (
+                self.backend.name == "dsapi"
+                and max_api_call_delta is not None
+                and original_result is not None
+                and original_result.passed
+                and self.backend.calls_made - calls_start >= max_api_call_delta
+            ):
+                break
+            plan = self.planner._plan_from_candidate(compile_result, candidate)
+            row = self._run_candidate_label(
+                task=task,
+                include_text=include_text,
+                created_at=created_at,
+                index=start_index + offset,
+                compile_result=compile_result,
+                plan=plan,
+                original_output=original_output,
+                original_trace=original_trace,
+                original_result=original_result,
+            )
+            rows.append(row)
+            original_run = row.get("_local_original_run")
+            if isinstance(original_run, Mapping) and original_result is None:
+                original_output = original_run.get("output")
+                original_trace = original_run.get("trace")
+                maybe_result = original_run.get("result")
+                original_result = maybe_result if isinstance(maybe_result, OracleResult) else None
+            if original_result is not None and not original_result.passed:
+                break
+        self.planner.observe(compile_result, session_id=session_id)
+        return tuple(rows)
+
+    def _run_candidate_label(
+        self,
+        *,
+        task: Mapping[str, Any],
+        include_text: bool,
+        created_at: str,
+        index: int,
+        compile_result: Any,
+        plan: Any,
+        original_output: Any,
+        original_trace: Any,
+        original_result: OracleResult | None,
+    ) -> dict[str, Any]:
         rewritten_messages = rewrite_messages(compile_result, plan)
         validation = self.validator.validate(
             original_messages=compile_result.messages,
@@ -467,7 +1104,11 @@ class UtilityLabelRunner:
             plan=plan,
         )
         candidate = plan.prefix_tree_candidate
-        agent_id = next(iter(candidate.agent_block_orders.keys())) if candidate and candidate.agent_block_orders else session_id
+        agent_id = (
+            next(iter(candidate.agent_block_orders.keys()))
+            if candidate and candidate.agent_block_orders
+            else str(getattr(compile_result, "session_id", "") or task.get("task_id") or "agent")
+        )
         original_prompt = _messages_to_prompt(compile_result.messages)
         reordered_prompt = (
             self.planner.materialize_prompt(candidate, agent_id)
@@ -482,13 +1123,14 @@ class UtilityLabelRunner:
             else {}
         )
         oracle = oracle_for_task(task, oracle_spec)
-        original_output, original_trace = self.backend.generate(
-            task=task,
-            prompt=original_prompt,
-            phase="original",
-            candidate=serialize_prefix_tree_candidate(candidate, include_text=False),
-        )
-        original_result = oracle.evaluate(task, original_output, original_trace)
+        if original_result is None:
+            original_output, original_trace = self.backend.generate(
+                task=task,
+                prompt=original_prompt,
+                phase="original",
+                candidate=serialize_prefix_tree_candidate(candidate, include_text=False),
+            )
+            original_result = oracle.evaluate(task, original_output, original_trace)
         reordered_result: OracleResult | None = None
         reordered_output: Any = None
         reordered_trace: Any = None
@@ -619,6 +1261,11 @@ class UtilityLabelRunner:
             "feature": feature,
             "original_prompt_hash": stable_hash(original_prompt),
             "reordered_prompt_hash": stable_hash(reordered_prompt),
+            "_local_original_run": {
+                "output": original_output,
+                "trace": original_trace,
+                "result": original_result,
+            },
         }
 
 
@@ -642,19 +1289,30 @@ def ensure_utility_dataset_layout(repo_root: str | Path = ".") -> None:
         "datasets/utility_validator/tasks/train",
         "datasets/utility_validator/tasks/valid",
         "datasets/utility_validator/tasks/test",
+        "datasets/utility_validator/tasks/expanded_train",
+        "datasets/utility_validator/tasks/expanded_valid",
+        "datasets/utility_validator/tasks/expanded_test",
         "datasets/utility_validator/labels/smoke",
         "datasets/utility_validator/labels/smoke_real",
         "datasets/utility_validator/labels/pilot_real",
         "datasets/utility_validator/labels/train",
         "datasets/utility_validator/labels/valid",
         "datasets/utility_validator/labels/test",
+        "datasets/utility_validator/labels/expanded_train",
+        "datasets/utility_validator/labels/expanded_valid",
+        "datasets/utility_validator/labels/expanded_test",
         "datasets/utility_validator/features/smoke",
         "datasets/utility_validator/features/smoke_real",
         "datasets/utility_validator/features/pilot_real",
         "datasets/utility_validator/features/train",
         "datasets/utility_validator/features/valid",
         "datasets/utility_validator/features/test",
+        "datasets/utility_validator/features/expanded_train",
+        "datasets/utility_validator/features/expanded_valid",
+        "datasets/utility_validator/features/expanded_test",
         "datasets/utility_validator/reports",
+        "datasets/utility_validator/reports/full_checkpoints",
+        "datasets/utility_validator/reports/expanded_checkpoints",
     ):
         (root / relative).mkdir(parents=True, exist_ok=True)
 
@@ -665,7 +1323,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default="datasets/utility_validator", help="Utility validator dataset root.")
     parser.add_argument("--output-dir", help="Alias for --output-root for compatibility with earlier task notes.")
     parser.add_argument("--source", default="all", help="all or comma-separated source names.")
-    parser.add_argument("--mode", default="smoke", choices=("smoke", "smoke_real", "pilot_real"))
+    parser.add_argument("--mode", default="smoke", choices=("smoke", "smoke_real", "pilot_real", "train_real", "expanded_real"))
     parser.add_argument("--backend", default="fake", choices=("fake", "dsapi"))
     parser.add_argument("--max-tasks", type=int, default=15)
     parser.add_argument("--include-text", action="store_true", help="Write local prompt text artifacts and mark rows.")
@@ -677,29 +1335,77 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-output-per-million", type=float)
     parser.add_argument("--project-config", help="Optional local project provider config path.")
     parser.add_argument("--model", help="Explicit DS API model override. Use v4flash/deepseek-v4-flash for real runs.")
+    parser.add_argument("--batch-size", type=int, default=25, help="train_real checkpoint label batch size.")
+    parser.add_argument("--checkpoint-api-calls", type=int, default=100, help="train_real max calls per checkpoint.")
+    parser.add_argument("--max-estimated-cost-usd", type=float, default=1.0, help="train_real pause budget.")
+    parser.add_argument("--target-true-count", type=int, default=150, help="expanded_real target preserved=true count.")
+    parser.add_argument("--target-false-count", type=int, default=50, help="expanded_real target preserved=false count.")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     output_root = args.output_dir or args.output_root
-    result = build_utility_validator_smoke_dataset(
-        repo_root=args.repo_root,
-        output_root=output_root,
-        source=args.source,
-        mode=args.mode,
-        backend=args.backend,
-        max_tasks=args.max_tasks,
-        include_text=args.include_text,
-        max_api_calls=args.max_api_calls,
-        confirm_cost_aware=args.confirm_cost_aware,
-        max_output_tokens=args.max_output_tokens,
-        timeout_seconds=args.timeout_seconds,
-        price_input_per_million=args.price_input_per_million,
-        price_output_per_million=args.price_output_per_million,
-        project_config_path=args.project_config,
-        model=args.model,
-    )
+    if args.mode == "expanded_real":
+        result = build_expanded_utility_validator_dataset(
+            repo_root=args.repo_root,
+            output_root=output_root,
+            source=args.source,
+            backend=args.backend,
+            max_tasks=args.max_tasks,
+            include_text=args.include_text,
+            max_api_calls=args.max_api_calls,
+            confirm_cost_aware=args.confirm_cost_aware,
+            max_output_tokens=args.max_output_tokens,
+            timeout_seconds=args.timeout_seconds,
+            price_input_per_million=args.price_input_per_million,
+            price_output_per_million=args.price_output_per_million,
+            project_config_path=args.project_config,
+            model=args.model,
+            batch_size=args.batch_size,
+            checkpoint_api_calls=args.checkpoint_api_calls,
+            max_estimated_cost_usd=args.max_estimated_cost_usd,
+            target_true_count=args.target_true_count,
+            target_false_count=args.target_false_count,
+        )
+    elif args.mode == "train_real":
+        result = build_full_utility_validator_dataset(
+            repo_root=args.repo_root,
+            output_root=output_root,
+            source=args.source,
+            backend=args.backend,
+            max_tasks=args.max_tasks,
+            include_text=args.include_text,
+            max_api_calls=args.max_api_calls,
+            confirm_cost_aware=args.confirm_cost_aware,
+            max_output_tokens=args.max_output_tokens,
+            timeout_seconds=args.timeout_seconds,
+            price_input_per_million=args.price_input_per_million,
+            price_output_per_million=args.price_output_per_million,
+            project_config_path=args.project_config,
+            model=args.model,
+            batch_size=args.batch_size,
+            checkpoint_api_calls=args.checkpoint_api_calls,
+            max_estimated_cost_usd=args.max_estimated_cost_usd,
+        )
+    else:
+        result = build_utility_validator_smoke_dataset(
+            repo_root=args.repo_root,
+            output_root=output_root,
+            source=args.source,
+            mode=args.mode,
+            backend=args.backend,
+            max_tasks=args.max_tasks,
+            include_text=args.include_text,
+            max_api_calls=args.max_api_calls,
+            confirm_cost_aware=args.confirm_cost_aware,
+            max_output_tokens=args.max_output_tokens,
+            timeout_seconds=args.timeout_seconds,
+            price_input_per_million=args.price_input_per_million,
+            price_output_per_million=args.price_output_per_million,
+            project_config_path=args.project_config,
+            model=args.model,
+        )
     print(json.dumps(result.summary, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -765,6 +1471,102 @@ def _expand_pilot_tasks(tasks: Sequence[Mapping[str, Any]], *, target_count: int
     return tuple(expanded)
 
 
+def _expanded_candidates_for_task(
+    *,
+    planner: HierarchicalPrefixPlanner,
+    compile_result: Any,
+    session_id: str,
+    strategies: Sequence[str],
+) -> tuple[Any, ...]:
+    wanted = tuple(dict.fromkeys(str(strategy) for strategy in strategies))
+    candidates = list(planner.generate_candidates(compile_result, session_id=session_id, top_k=8))
+    if "adversarial" in wanted:
+        adversarial = _adversarial_candidate_for_task(
+            planner=planner,
+            compile_result=compile_result,
+            session_id=session_id,
+        )
+        if adversarial is not None:
+            candidates.append(adversarial)
+    by_strategy: dict[str, Any] = {}
+    for candidate in candidates:
+        strategy = _candidate_strategy(candidate)
+        by_strategy.setdefault(strategy, candidate)
+    selected = [by_strategy[strategy] for strategy in wanted if strategy in by_strategy]
+    if not selected and candidates:
+        selected.append(candidates[0])
+    return tuple(selected)
+
+
+def _adversarial_candidate_for_task(
+    *,
+    planner: HierarchicalPrefixPlanner,
+    compile_result: Any,
+    session_id: str,
+) -> Any | None:
+    blocks = tuple(getattr(compile_result, "blocks", ()) or ())
+    if not blocks:
+        return None
+    promoted = tuple(_adversarial_promoted_blocks(blocks))
+    if not promoted:
+        return None
+    return planner._build_candidate(
+        compile_result=compile_result,
+        session_id=session_id,
+        policy_name="adversarial",
+        promoted_blocks=promoted,
+        generation_reason="boundary candidate moves conditional format/tool/state context while hard gate still blocks local-only risks",
+    )
+
+
+def _adversarial_promoted_blocks(blocks: Sequence[Any]) -> tuple[Any, ...]:
+    preferred_semantics = {
+        SemanticType.OUTPUT_FORMAT,
+        SemanticType.SHARED_TOOL_DESCRIPTION,
+        SemanticType.SHARED_CONTEXT,
+        SemanticType.TEAM_POLICY,
+        SemanticType.GLOBAL_TASK_BACKGROUND,
+    }
+    candidates = [
+        block
+        for block in blocks
+        if getattr(block, "is_system_text", False)
+        and getattr(block, "movability", None) in {Movability.SAFE_PREFIX, Movability.CONDITIONAL_PREFIX}
+        and getattr(block, "share_scope", None) in {ShareScope.GLOBAL, ShareScope.SUBGROUP}
+        and getattr(block, "semantic_type", None) in preferred_semantics
+        and not _block_has_nonshareable_training_risk(block)
+    ]
+    if not candidates:
+        return ()
+    ordered = sorted(
+        candidates,
+        key=lambda block: (
+            {
+                SemanticType.OUTPUT_FORMAT: 0,
+                SemanticType.SHARED_TOOL_DESCRIPTION: 1,
+                SemanticType.SHARED_CONTEXT: 2,
+                SemanticType.TEAM_POLICY: 3,
+                SemanticType.GLOBAL_TASK_BACKGROUND: 4,
+            }.get(getattr(block, "semantic_type", None), 9),
+            -int(getattr(block, "original_position").message_index),
+            -int(getattr(block, "original_position").part_index),
+            str(getattr(block, "block_id", "")),
+        ),
+    )
+    return tuple(ordered[:3])
+
+
+def _block_has_nonshareable_training_risk(block: Any) -> bool:
+    return bool(
+        getattr(block, "contains_private_info", False)
+        or getattr(block, "contains_role_identity", False)
+        or getattr(block, "contains_tool_permission", False)
+        or getattr(block, "contains_latest_user_instruction", False)
+        or getattr(block, "contains_tool_result", False)
+        or getattr(block, "contains_credential", False)
+    )
+
+
 def _output_paths(output: Path, mode: str) -> dict[str, Path]:
     summary_name = "real_smoke_summary.json" if mode == "smoke_real" else f"{mode}_summary.json"
     return {
@@ -772,6 +1574,374 @@ def _output_paths(output: Path, mode: str) -> dict[str, Path]:
         "labels": output / "labels" / mode / "utility_labels.jsonl",
         "features": output / "features" / mode / "training_features.jsonl",
         "summary": output / "reports" / summary_name,
+    }
+
+
+def _full_output_paths(output: Path) -> dict[str, Any]:
+    return {
+        "tasks": {split: output / "tasks" / split / "utility_tasks.jsonl" for split in FINAL_SPLITS},
+        "labels": {split: output / "labels" / split / "utility_labels.jsonl" for split in FINAL_SPLITS},
+        "features": {split: output / "features" / split / "training_features.jsonl" for split in FINAL_SPLITS},
+        "feature_aliases": {
+            split: output / "features" / split / f"{split}_features.jsonl" for split in FINAL_SPLITS
+        },
+        "reports": {
+            "full_build_summary": output / "reports" / "full_build_summary.json",
+            "cost_summary": output / "reports" / "cost_summary.json",
+            "quality_report": output / "reports" / "quality_report.json",
+            "dataset_card": output / "reports" / "dataset_card.md",
+            "training_usage": output / "reports" / "training_usage.md",
+        },
+    }
+
+
+def _expanded_output_paths(output: Path) -> dict[str, Any]:
+    return {
+        "tasks": {split: output / "tasks" / split / "utility_tasks.jsonl" for split in EXPANDED_SPLITS},
+        "labels": {split: output / "labels" / split / "utility_labels.jsonl" for split in EXPANDED_SPLITS},
+        "features": {split: output / "features" / split / "training_features.jsonl" for split in EXPANDED_SPLITS},
+        "feature_aliases": {
+            "expanded_train": output / "features" / "expanded_train" / "train_features.jsonl",
+            "expanded_valid": output / "features" / "expanded_valid" / "valid_features.jsonl",
+            "expanded_test": output / "features" / "expanded_test" / "test_features.jsonl",
+        },
+        "reports": {
+            "full_build_summary": output / "reports" / "expanded_build_summary.json",
+            "cost_summary": output / "reports" / "expanded_cost_summary.json",
+            "quality_report": output / "reports" / "expanded_quality_report.json",
+            "dataset_card": output / "reports" / "expanded_dataset_card.md",
+            "training_usage": output / "reports" / "expanded_training_usage.md",
+        },
+    }
+
+
+def _prepare_full_output_dirs(paths: Mapping[str, Any]) -> None:
+    for group in ("tasks", "labels", "features", "feature_aliases", "reports"):
+        values = paths.get(group)
+        if isinstance(values, Mapping):
+            for path in values.values():
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+    split_names = tuple(paths.get("tasks", {}).keys()) if isinstance(paths.get("tasks"), Mapping) else FINAL_SPLITS
+    for split in split_names:
+        for group in ("tasks", "labels", "features", "feature_aliases"):
+            if split not in paths.get(group, {}):
+                continue
+            path = paths[group][split]
+            if Path(path).exists():
+                Path(path).unlink()
+
+
+def _select_expanded_rows(
+    *,
+    tasks: Sequence[Mapping[str, Any]],
+    labels: Sequence[Mapping[str, Any]],
+    features: Sequence[Mapping[str, Any]],
+    target_true_count: int,
+    target_false_count: int,
+    seed_label_ids: set[str] | None = None,
+    seed_feature_label_ids: set[str] | None = None,
+) -> Mapping[str, Any]:
+    seed_label_ids = seed_label_ids or set()
+    seed_feature_label_ids = seed_feature_label_ids or set()
+    unique_labels = _unique_labels_by_id(labels)
+    true_labels = tuple(label for label in unique_labels if label.get("is_utility_preserved") is True)
+    false_labels = tuple(label for label in unique_labels if label.get("is_utility_preserved") is False)
+    skipped_labels = tuple(label for label in unique_labels if label.get("is_utility_preserved") not in {True, False})
+    selected_false = _stratified_label_take(false_labels, target_false_count)
+    selected_true = _stratified_label_take(true_labels, target_true_count)
+    selected_trainable_ids = {
+        str(label.get("label_id"))
+        for label in (*selected_true, *selected_false)
+        if label.get("label_id") is not None
+    }
+    selected_skipped = tuple(skipped_labels)
+    selected_labels = _sort_labels_for_output((*selected_true, *selected_false, *selected_skipped))
+    feature_by_label = _feature_by_label_id(features)
+    selected_features = tuple(
+        _feature_with_label_metadata(feature_by_label[str(label.get("label_id"))], label)
+        for label in selected_labels
+        if str(label.get("label_id")) in selected_trainable_ids
+        and str(label.get("label_id")) in feature_by_label
+    )
+    task_by_id = _task_by_id(tasks)
+    selected_task_ids = []
+    seen_task_ids: set[str] = set()
+    for label in selected_labels:
+        task_id = str(label.get("task_id") or "")
+        if not task_id or task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task_id)
+        selected_task_ids.append(task_id)
+    selected_tasks = tuple(
+        task_by_id.get(task_id) or _task_stub_from_label(next(label for label in selected_labels if str(label.get("task_id") or "") == task_id))
+        for task_id in selected_task_ids
+    )
+    feature_counts = _preserved_counts(selected_features)
+    label_counts = _preserved_counts(selected_labels)
+    return {
+        "tasks": selected_tasks,
+        "labels": selected_labels,
+        "features": selected_features,
+        "selection_report": {
+            "policy": (
+                "keep real false labels up to target_false_count, select true labels by deterministic "
+                "source/strategy strata up to target_true_count, keep original-failed labels as skipped audit rows, "
+                "and exclude skipped rows from features"
+            ),
+            "raw_label_count": len(unique_labels),
+            "raw_feature_count": len(features),
+            "raw_is_utility_preserved_counts": _preserved_counts(unique_labels),
+            "selected_task_count": len(selected_tasks),
+            "selected_label_count": len(selected_labels),
+            "selected_feature_count": len(selected_features),
+            "selected_is_utility_preserved_counts": label_counts,
+            "selected_feature_is_utility_preserved_counts": feature_counts,
+            "selected_new_label_count": sum(
+                1 for label in selected_labels if str(label.get("label_id") or "") not in seed_label_ids
+            ),
+            "selected_new_feature_count": sum(
+                1 for feature in selected_features if str(feature.get("label_id") or "") not in seed_feature_label_ids
+            ),
+            "selected_false_count": label_counts["false"],
+            "selected_true_count": label_counts["true"],
+            "selected_skipped_count": label_counts["skipped"],
+            "target_false_count": target_false_count,
+            "target_true_count": target_true_count,
+        },
+    }
+
+
+def _unique_labels_by_id(labels: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    seen: set[str] = set()
+    unique: list[Mapping[str, Any]] = []
+    for label in labels:
+        label_id = str(label.get("label_id") or "")
+        if not label_id:
+            label_id = f"{label.get('task_id')}::{label.get('candidate_strategy')}::{len(unique)}"
+        if label_id in seen:
+            continue
+        seen.add(label_id)
+        unique.append(label)
+    return tuple(unique)
+
+
+def _feature_by_label_id(features: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    feature_by_label: dict[str, Mapping[str, Any]] = {}
+    for feature in features:
+        label_id = str(feature.get("label_id") or "")
+        if label_id and label_id not in feature_by_label:
+            feature_by_label[label_id] = feature
+    return feature_by_label
+
+
+def _feature_with_label_metadata(feature: Mapping[str, Any], label: Mapping[str, Any]) -> Mapping[str, Any]:
+    enriched = dict(feature)
+    enriched.setdefault("original_run_status", label.get("original_run_status"))
+    enriched.setdefault("reordered_run_status", label.get("reordered_run_status"))
+    enriched.setdefault("api_model", label.get("api_model"))
+    enriched.setdefault("input_tokens", label.get("input_tokens"))
+    enriched.setdefault("output_tokens", label.get("output_tokens"))
+    enriched.setdefault("cached_tokens", label.get("cached_tokens"))
+    enriched.setdefault("latency", label.get("latency"))
+    enriched.setdefault("estimated_cost", label.get("estimated_cost"))
+    return enriched
+
+
+def _task_by_id(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    task_by_id: dict[str, Mapping[str, Any]] = {}
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        if task_id and task_id not in task_by_id:
+            task_by_id[task_id] = task
+    return task_by_id
+
+
+def _unique_tasks_by_id(tasks: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    seen: set[str] = set()
+    unique: list[Mapping[str, Any]] = []
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        if task_id and task_id in seen:
+            continue
+        if task_id:
+            seen.add(task_id)
+        unique.append(task)
+    return tuple(unique)
+
+
+def _task_stub_from_label(label: Mapping[str, Any]) -> Mapping[str, Any]:
+    return {
+        "schema_version": "utility-task-v1",
+        "task_id": label.get("task_id"),
+        "dataset_source": label.get("dataset_source"),
+        "scenario_type": label.get("scenario_type"),
+        "prompt_text_included": False,
+        "source_metadata": {"recovered_from_label": True},
+    }
+
+
+def _stratified_label_take(labels: Sequence[Mapping[str, Any]], target: int) -> tuple[Mapping[str, Any], ...]:
+    unique = _sort_labels_for_output(_unique_labels_by_id(labels))
+    if target <= 0 or not unique:
+        return ()
+    if len(unique) <= target:
+        return tuple(unique)
+    selected: list[Mapping[str, Any]] = []
+    selected_ids: set[str] = set()
+    base_quota = target // len(DATASET_SOURCES)
+    remainder = target % len(DATASET_SOURCES)
+    for source_index, source in enumerate(DATASET_SOURCES):
+        quota = base_quota + (1 if source_index < remainder else 0)
+        source_labels = tuple(label for label in unique if str(label.get("dataset_source") or "") == source)
+        for label in _round_robin_labels_by_strategy(source_labels, quota):
+            label_id = str(label.get("label_id") or "")
+            if label_id and label_id not in selected_ids:
+                selected.append(label)
+                selected_ids.add(label_id)
+    for label in unique:
+        if len(selected) >= target:
+            break
+        label_id = str(label.get("label_id") or "")
+        if label_id and label_id not in selected_ids:
+            selected.append(label)
+            selected_ids.add(label_id)
+    return tuple(selected)
+
+
+def _round_robin_labels_by_strategy(labels: Sequence[Mapping[str, Any]], quota: int) -> tuple[Mapping[str, Any], ...]:
+    if quota <= 0:
+        return ()
+    sorted_labels = _sort_labels_for_output(labels)
+    strategy_order = (*EXPANDED_STRATEGIES, "none", "unknown")
+    buckets: dict[str, list[Mapping[str, Any]]] = {strategy: [] for strategy in strategy_order}
+    for label in sorted_labels:
+        buckets.setdefault(str(label.get("candidate_strategy") or "unknown"), []).append(label)
+    selected: list[Mapping[str, Any]] = []
+    while len(selected) < quota:
+        progressed = False
+        for strategy in strategy_order:
+            bucket = buckets.get(strategy) or []
+            if not bucket:
+                continue
+            selected.append(bucket.pop(0))
+            progressed = True
+            if len(selected) >= quota:
+                break
+        if not progressed:
+            break
+    return tuple(selected)
+
+
+def _sort_labels_for_output(labels: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    source_rank = {source: index for index, source in enumerate(DATASET_SOURCES)}
+    strategy_rank = {strategy: index for index, strategy in enumerate(EXPANDED_STRATEGIES)}
+    strategy_rank.setdefault("none", len(strategy_rank))
+    strategy_rank.setdefault("unknown", len(strategy_rank))
+    return tuple(
+        sorted(
+            labels,
+            key=lambda label: (
+                source_rank.get(str(label.get("dataset_source") or ""), len(source_rank)),
+                str(label.get("task_id") or ""),
+                strategy_rank.get(str(label.get("candidate_strategy") or "unknown"), len(strategy_rank)),
+                str(label.get("label_id") or ""),
+            ),
+        )
+    )
+
+
+def _batch_tasks(tasks: Sequence[Mapping[str, Any]], *, batch_size: int) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    return tuple(tuple(tasks[index : index + batch_size]) for index in range(0, len(tasks), batch_size))
+
+
+def _checkpoint_report(
+    *,
+    batch_index: int,
+    tasks: Sequence[Mapping[str, Any]],
+    labels: Sequence[Mapping[str, Any]],
+    features: Sequence[Mapping[str, Any]],
+    cost_before: Mapping[str, Any],
+    cost_after: Mapping[str, Any],
+    max_estimated_cost_usd: float,
+    max_api_calls: int,
+    checkpoint_api_calls: int,
+    output_root: Path,
+    created_at: str,
+    scan_splits: Sequence[str] = FINAL_SPLITS,
+    report_names: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    calls_delta = _int(cost_after.get("api_call_count")) - _int(cost_before.get("api_call_count"))
+    cost_delta = float(cost_after.get("estimated_cost_usd") or 0.0) - float(cost_before.get("estimated_cost_usd") or 0.0)
+    latency_delta = float(cost_after.get("latency_seconds_total") or 0.0) - float(cost_before.get("latency_seconds_total") or 0.0)
+    label_source_counts = Counter(str(label.get("label_source")) for label in labels)
+    preserved_counts = Counter(str(label.get("is_utility_preserved")) for label in labels)
+    failure_counts = Counter(str(label.get("failure_type") or "none") for label in labels)
+    source_counts = Counter(str(label.get("dataset_source")) for label in labels)
+    trainable_label_count = sum(1 for label in labels if label.get("is_utility_preserved") in {True, False})
+    runtime_error_count = failure_counts.get("runtime_error", 0)
+    original_failed_count = sum(1 for label in labels if label.get("original_run_status") == "failed")
+    schema_like_errors = _schema_parse_error_count(labels)
+    prompt_text_saved = _has_prompt_text(labels) or _has_prompt_text(features)
+    scan_report = _scan_prompt_safe_outputs(output_root, split_names=scan_splits, report_names=report_names)
+    jsonl_report = _jsonl_readability_report(output_root)
+    checks = {
+        "model_is_deepseek_v4_flash": cost_after.get("model") == "deepseek-v4-flash",
+        "model_is_not_pro": not bool(cost_after.get("model_is_pro")),
+        "label_source_all_dsapi": bool(labels)
+        and all(label.get("label_source") == "dsapi_execution_oracle" for label in labels),
+        "no_fake_smoke_oracle": all(label.get("label_source") != "fake_smoke_oracle" for label in labels),
+        "prompt_text_saved_false": not prompt_text_saved,
+        "no_key_prompt_or_private_scan_hits": not scan_report["has_hits"],
+        "original_failed_skipped_not_in_features": _original_failed_skipped_not_in_features(labels, features),
+        "has_true_false_skipped_counts": bool(labels) and any(key in preserved_counts for key in ("True", "False", "None")),
+        "failure_type_distribution_ok": bool(failure_counts),
+        "source_coverage_ok": all(source in source_counts for source in DATASET_SOURCES) if batch_index == 1 else bool(source_counts),
+        "cost_within_budget": float(cost_after.get("estimated_cost_usd") or 0.0) <= max_estimated_cost_usd,
+        "latency_not_abnormal": (latency_delta / calls_delta if calls_delta else 0.0) <= 8.0,
+        "runtime_schema_parse_error_rate_ok": (
+            (runtime_error_count + schema_like_errors) / len(labels) <= 0.2 if labels else False
+        ),
+        "feature_count_matches_trainable_labels": len(features) == trainable_label_count,
+        "jsonl_schema_readable": jsonl_report["readable"],
+        "checkpoint_api_calls_within_limit": calls_delta <= checkpoint_api_calls,
+        "total_api_calls_within_limit": _int(cost_after.get("api_call_count")) <= max_api_calls,
+        "original_failed_rate_ok": (original_failed_count / len(labels) <= 0.4 if labels else False),
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    return {
+        "schema_version": "utility-validator-full-checkpoint-v1",
+        "created_at": created_at,
+        "batch_index": batch_index,
+        "passed": not blockers,
+        "blockers": blockers,
+        "checks": checks,
+        "task_count": len(tasks),
+        "label_count": len(labels),
+        "feature_count": len(features),
+        "trainable_label_count": trainable_label_count,
+        "label_source_counts": dict(sorted(label_source_counts.items())),
+        "source_counts": dict(sorted(source_counts.items())),
+        "is_utility_preserved_counts": dict(sorted(preserved_counts.items())),
+        "failure_type_counts": dict(sorted(failure_counts.items())),
+        "runtime_error_rate": runtime_error_count / len(labels) if labels else 0.0,
+        "original_failed_rate": original_failed_count / len(labels) if labels else 0.0,
+        "api_call_count_delta": calls_delta,
+        "estimated_cost_delta": cost_delta,
+        "latency_seconds_avg_delta": latency_delta / calls_delta if calls_delta else 0.0,
+        "cost_summary_after": {
+            "api_call_count": cost_after.get("api_call_count"),
+            "model": cost_after.get("model"),
+            "model_is_v4_flash": cost_after.get("model_is_v4_flash"),
+            "model_is_pro": cost_after.get("model_is_pro"),
+            "total_input_tokens": cost_after.get("total_input_tokens"),
+            "total_output_tokens": cost_after.get("total_output_tokens"),
+            "total_cached_tokens": cost_after.get("total_cached_tokens"),
+            "estimated_cost_usd": cost_after.get("estimated_cost_usd"),
+            "latency_seconds_avg": cost_after.get("latency_seconds_avg"),
+        },
+        "scan_report": scan_report,
+        "jsonl_report": jsonl_report,
+        "exception_handling": "merged_only_if_passed",
     }
 
 
@@ -838,7 +2008,7 @@ def _training_feature(
     hard_warning_count = sum(1 for tag in risk_tags if tag in {"agent_identity", "private_memory", "private_tool_permission", "credential"})
     return {
         "schema_version": "training-feature-v1",
-        "sample_id": _safe_id(f"uv_feature_{sample_index:04d}_{task.get('task_id')}"),
+        "sample_id": _safe_id(f"uv_feature_{sample_index:04d}_{task.get('task_id')}_{label.get('candidate_strategy')}"),
         "label_id": label.get("label_id"),
         "task_id": task.get("task_id"),
         "candidate_id": candidate_id,
@@ -872,6 +2042,8 @@ def _training_feature(
         "cache_estimator_used_fallback": cache_estimate.get("used_fallback"),
         "hard_warning_count": hard_warning_count,
         "whether_label_is_utility_verified": label.get("label_source") != "fake_smoke_oracle",
+        "original_run_status": label.get("original_run_status"),
+        "reordered_run_status": label.get("reordered_run_status"),
         "is_utility_preserved": label.get("is_utility_preserved"),
         "failure_type": label.get("failure_type"),
         "api_model": label.get("api_model"),
@@ -961,6 +2133,8 @@ def _dsapi_system_instruction(task: Mapping[str, Any]) -> str:
         if isinstance(task.get("oracle_spec"), Mapping)
         else {}
     )
+    if task.get("_local_dsapi_prompt_sensitive") is True:
+        return _dsapi_prompt_sensitive_system_instruction(oracle_type=oracle_type, oracle_spec=oracle_spec)
     common = (
         "You are a deterministic smoke-test model for Utility Validator data labeling. "
         "Return only one strict JSON object. Do not add markdown, comments, or extra prose. "
@@ -1005,6 +2179,16 @@ def _dsapi_system_instruction(task: Mapping[str, Any]) -> str:
 
 
 def _dsapi_user_content(task: Mapping[str, Any], prompt: str) -> str:
+    if task.get("_local_dsapi_prompt_sensitive") is True:
+        return "\n\n".join(
+            [
+                _dsapi_prompt_sensitive_output_shape(task),
+                "PROMPT_UNDER_TEST_START",
+                prompt,
+                "PROMPT_UNDER_TEST_END",
+                "Execute the prompt under test as written. Return only the JSON object.",
+            ]
+        )
     return "\n\n".join(
         [
             _dsapi_output_contract(task),
@@ -1013,6 +2197,77 @@ def _dsapi_user_content(task: Mapping[str, Any], prompt: str) -> str:
             "PROMPT_UNDER_TEST_END",
         ]
     )
+
+
+def _dsapi_prompt_sensitive_system_instruction(*, oracle_type: str, oracle_spec: Mapping[str, Any]) -> str:
+    common = (
+        "You are executing a candidate prompt for Utility Validator labeling. "
+        "Treat the prompt under test as the task instruction. The harness only specifies the JSON response shape. "
+        "If the prompt under test has lost, weakened, or reordered an important constraint, follow the prompt under test "
+        "rather than correcting it from the harness. Return exactly one JSON object and no prose. "
+    )
+    if oracle_type == "unit_test":
+        return common + (
+            "Return fields status and tests_passed. Set tests_passed true only if the prompt under test preserves "
+            "the code task, function signature, boundary conditions, and test intent; otherwise set false."
+        )
+    if oracle_type == "json_schema":
+        return common + (
+            "Return the JSON object requested by the prompt under test. Do not add fields unless the prompt under test "
+            "requests them. Do not repair missing or weakened format constraints using hidden oracle knowledge."
+        )
+    if oracle_type == "tool_trace":
+        return common + (
+            "Return fields status, tool_calls, and final_result. Choose the tool calls implied by the prompt under test. "
+            "If role/tool permission placement makes the allowed tool ambiguous, reflect that ambiguity in the chosen tool_calls."
+        )
+    if oracle_type == "privacy_check":
+        return common + (
+            "Return fields status, text, and leaked_private_memory. Write the response requested by the prompt under test. "
+            "Set leaked_private_memory true if the response reveals private memory or secret-like content."
+        )
+    if oracle_type == "role_check":
+        return common + (
+            "Return fields status, text, and role_boundary_ok. Respond according to the prompt under test. "
+            "Set role_boundary_ok false if the response speaks as the wrong role or claims another role's authority."
+        )
+    if oracle_type == "state_check":
+        return common + (
+            "Return fields status, state_consistent, and observed_event_order. Use the event order implied by the prompt under test; "
+            "set state_consistent false if the state/order constraint is lost or contradicted."
+        )
+    return common + "Return a JSON object describing the prompt execution."
+
+
+def _dsapi_prompt_sensitive_output_shape(task: Mapping[str, Any]) -> str:
+    oracle_type = str(task.get("expected_oracle_type") or "")
+    oracle_spec = (
+        task.get("_local_oracle_spec")
+        if isinstance(task.get("_local_oracle_spec"), Mapping)
+        else task.get("oracle_spec")
+        if isinstance(task.get("oracle_spec"), Mapping)
+        else {}
+    )
+    if oracle_type == "unit_test":
+        return 'OUTPUT_SHAPE: {"status": "passed|failed", "tests_passed": boolean}.'
+    if oracle_type == "json_schema":
+        schema = oracle_spec.get("json_schema") if isinstance(oracle_spec.get("json_schema"), Mapping) else {}
+        required = tuple(str(field) for field in schema.get("required") or ())
+        properties = tuple(str(field) for field in (schema.get("properties") or {}).keys()) if isinstance(schema.get("properties"), Mapping) else ()
+        return (
+            "OUTPUT_SHAPE: Return one JSON object. Oracle expected fields are "
+            + json.dumps({"required": required, "properties": properties}, ensure_ascii=False)
+            + ", but obey the prompt under test if it conflicts."
+        )
+    if oracle_type == "tool_trace":
+        return 'OUTPUT_SHAPE: {"status": "passed|failed", "tool_calls": [{"name": string}], "final_result": string}.'
+    if oracle_type == "privacy_check":
+        return 'OUTPUT_SHAPE: {"status": "passed|failed", "text": string, "leaked_private_memory": boolean}.'
+    if oracle_type == "role_check":
+        return 'OUTPUT_SHAPE: {"status": "passed|failed", "text": string, "role_boundary_ok": boolean}.'
+    if oracle_type == "state_check":
+        return 'OUTPUT_SHAPE: {"status": "passed|failed", "state_consistent": boolean, "observed_event_order": [string]}.'
+    return "OUTPUT_SHAPE: Return one JSON object."
 
 
 def _dsapi_output_contract(task: Mapping[str, Any]) -> str:
@@ -1277,6 +2532,343 @@ def _summary(
     }
 
 
+def _split_full_rows(
+    tasks: Sequence[Mapping[str, Any]],
+    labels: Sequence[Mapping[str, Any]],
+    features: Sequence[Mapping[str, Any]],
+    *,
+    split_names: Sequence[str] = FINAL_SPLITS,
+) -> Mapping[str, Mapping[str, tuple[Mapping[str, Any], ...]]]:
+    split_label_rows = _split_labels_by_status_source(labels, split_names=split_names)
+    feature_by_label = _feature_by_label_id(features)
+    task_by_id = _task_by_id(_unique_tasks_by_id(tasks))
+    result: dict[str, dict[str, tuple[Mapping[str, Any], ...]]] = {}
+    for split in split_names:
+        ordered_labels = tuple(split_label_rows[split])
+        ordered_tasks = _tasks_for_labels(ordered_labels, task_by_id)
+        ordered_features = tuple(
+            feature_by_label[str(label.get("label_id") or "")]
+            for label in ordered_labels
+            if str(label.get("label_id") or "") in feature_by_label
+        )
+        result[split] = {"tasks": ordered_tasks, "labels": ordered_labels, "features": ordered_features}
+    return result
+
+
+def _split_labels_by_status_source(
+    labels: Sequence[Mapping[str, Any]],
+    *,
+    split_names: Sequence[str] = FINAL_SPLITS,
+) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
+    unique = _sort_labels_for_output(_unique_labels_by_id(labels))
+    split_rows: dict[str, list[Mapping[str, Any]]] = {split: [] for split in split_names}
+    for status in (True, False, None):
+        status_labels = tuple(
+            label
+            for label in unique
+            if (
+                label.get("is_utility_preserved") is status
+                if status is not None
+                else label.get("is_utility_preserved") not in {True, False}
+            )
+        )
+        status_split_rows = _split_one_label_status(status_labels, split_names=split_names)
+        for split in split_names:
+            split_rows[split].extend(status_split_rows[split])
+    return {split: _sort_labels_for_output(rows) for split, rows in split_rows.items()}
+
+
+def _split_one_label_status(
+    labels: Sequence[Mapping[str, Any]],
+    *,
+    split_names: Sequence[str],
+) -> Mapping[str, tuple[Mapping[str, Any], ...]]:
+    split_rows: dict[str, list[Mapping[str, Any]]] = {split: [] for split in split_names}
+    if not labels:
+        return {split: () for split in split_names}
+    for source in DATASET_SOURCES:
+        source_labels = tuple(label for label in labels if str(label.get("dataset_source") or "") == source)
+        for index, label in enumerate(source_labels):
+            split = _split_for_source_index(index, len(source_labels), split_names=split_names)
+            split_rows[split].append(label)
+    desired_counts = _desired_split_counts(len(labels), split_names=split_names)
+    _rebalance_split_rows(split_rows, desired_counts)
+    return {split: tuple(rows) for split, rows in split_rows.items()}
+
+
+def _desired_split_counts(total: int, *, split_names: Sequence[str]) -> Mapping[str, int]:
+    train_split, valid_split, test_split = tuple(split_names)
+    train_count = int(total * 0.8)
+    valid_count = int(total * 0.1)
+    test_count = total - train_count - valid_count
+    if total >= 10:
+        return {train_split: train_count, valid_split: valid_count, test_split: test_count}
+    if total == 1:
+        return {train_split: 1, valid_split: 0, test_split: 0}
+    if total == 2:
+        return {train_split: 1, valid_split: 0, test_split: 1}
+    return {train_split: max(1, total - 2), valid_split: 1, test_split: 1}
+
+
+def _rebalance_split_rows(split_rows: dict[str, list[Mapping[str, Any]]], desired_counts: Mapping[str, int]) -> None:
+    while True:
+        overfull = [
+            split
+            for split, rows in split_rows.items()
+            if len(rows) > int(desired_counts.get(split, 0))
+        ]
+        underfull = [
+            split
+            for split, rows in split_rows.items()
+            if len(rows) < int(desired_counts.get(split, 0))
+        ]
+        if not overfull or not underfull:
+            break
+        source = max(overfull, key=lambda split: len(split_rows[split]) - int(desired_counts.get(split, 0)))
+        target = max(underfull, key=lambda split: int(desired_counts.get(split, 0)) - len(split_rows[split]))
+        split_rows[target].append(split_rows[source].pop())
+
+
+def _tasks_for_labels(labels: Sequence[Mapping[str, Any]], task_by_id: Mapping[str, Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    tasks: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for label in labels:
+        task_id = str(label.get("task_id") or "")
+        if not task_id or task_id in seen:
+            continue
+        seen.add(task_id)
+        tasks.append(task_by_id.get(task_id) or _task_stub_from_label(label))
+    return tuple(tasks)
+
+
+def _split_for_source_index(index: int, count: int, *, split_names: Sequence[str] = FINAL_SPLITS) -> str:
+    train_split, valid_split, test_split = tuple(split_names)
+    if count >= 10:
+        train_cut = max(1, int(count * 0.8))
+        valid_cut = max(train_cut + 1, int(count * 0.9))
+        if index < train_cut:
+            return train_split
+        if index < valid_cut:
+            return valid_split
+        return test_split
+    if index == count - 1:
+        return test_split
+    if index == count - 2:
+        return valid_split
+    return train_split
+
+
+def _write_split_outputs(paths: Mapping[str, Any], split_rows: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]]) -> None:
+    for split in split_rows.keys():
+        rows = split_rows[split]
+        _write_jsonl(paths["tasks"][split], rows["tasks"])
+        _write_jsonl(paths["labels"][split], rows["labels"])
+        _write_jsonl(paths["features"][split], rows["features"])
+        _write_jsonl(paths["feature_aliases"][split], rows["features"])
+
+
+def _load_existing_full_rows(output: Path) -> Mapping[str, tuple[dict[str, Any], ...]]:
+    tasks: list[dict[str, Any]] = []
+    labels: list[dict[str, Any]] = []
+    features: list[dict[str, Any]] = []
+    for split in FINAL_SPLITS:
+        tasks.extend(_read_jsonl_safe(output / "tasks" / split / "utility_tasks.jsonl"))
+        labels.extend(_read_jsonl_safe(output / "labels" / split / "utility_labels.jsonl"))
+        features.extend(_read_jsonl_safe(output / "features" / split / "training_features.jsonl"))
+    return {"tasks": tuple(tasks), "labels": tuple(labels), "features": tuple(features)}
+
+
+def _label_dedupe_key(label: Mapping[str, Any]) -> tuple[str, str]:
+    return str(label.get("task_id") or ""), str(label.get("candidate_strategy") or "")
+
+
+def _preserved_counts(labels: Sequence[Mapping[str, Any]]) -> Mapping[str, int]:
+    return {
+        "true": sum(1 for label in labels if label.get("is_utility_preserved") is True),
+        "false": sum(1 for label in labels if label.get("is_utility_preserved") is False),
+        "skipped": sum(1 for label in labels if label.get("is_utility_preserved") not in {True, False}),
+    }
+
+
+def _mark_expanded_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    cloned = copy.deepcopy(dict(task))
+    cloned["_local_dsapi_prompt_sensitive"] = True
+    source_metadata = cloned.get("source_metadata") if isinstance(cloned.get("source_metadata"), Mapping) else {}
+    cloned["source_metadata"] = {**dict(source_metadata), "expanded_real_prompt_sensitive": True}
+    return cloned
+
+
+def _expanded_report_file_names() -> Mapping[str, str]:
+    return {
+        "full_build_summary": "expanded_build_summary.json",
+        "cost_summary": "expanded_cost_summary.json",
+        "quality_report": "expanded_quality_report.json",
+        "dataset_card": "expanded_dataset_card.md",
+        "training_usage": "expanded_training_usage.md",
+    }
+
+
+def _full_cost_summary(cost_summary: Mapping[str, Any]) -> Mapping[str, Any]:
+    return {
+        "schema_version": "utility-validator-full-cost-summary-v1",
+        "api_call_count": _int(cost_summary.get("api_call_count")),
+        "max_api_calls": _int(cost_summary.get("max_api_calls")),
+        "model": cost_summary.get("model"),
+        "model_is_v4_flash": bool(cost_summary.get("model_is_v4_flash")),
+        "model_is_pro": bool(cost_summary.get("model_is_pro")),
+        "api_key_stored": bool(cost_summary.get("api_key_stored")),
+        "total_input_tokens": _int(cost_summary.get("total_input_tokens")),
+        "total_output_tokens": _int(cost_summary.get("total_output_tokens")),
+        "total_cached_tokens": _int(cost_summary.get("total_cached_tokens")),
+        "cached_tokens": _int(cost_summary.get("cached_tokens")),
+        "total_tokens": _int(cost_summary.get("total_tokens")),
+        "estimated_cost_usd": float(cost_summary.get("estimated_cost_usd") or 0.0),
+        "provider_cost_usd": float(cost_summary.get("provider_cost_usd") or 0.0),
+        "price_input_per_million": float(cost_summary.get("price_input_per_million") or 0.0),
+        "price_output_per_million": float(cost_summary.get("price_output_per_million") or 0.0),
+        "latency_seconds_total": float(cost_summary.get("latency_seconds_total") or 0.0),
+        "latency_seconds_avg": float(cost_summary.get("latency_seconds_avg") or 0.0),
+        "calls_recorded": len(tuple(cost_summary.get("calls") or ())),
+    }
+
+
+def _full_quality_report(
+    *,
+    split_rows: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+    checkpoint_reports: Sequence[Mapping[str, Any]],
+    anomalous_batches: Sequence[Mapping[str, Any]],
+    output_root: Path,
+    created_at: str,
+    split_names: Sequence[str] = FINAL_SPLITS,
+    scan_report_names: Mapping[str, str] | None = None,
+    schema_version: str = "utility-validator-full-quality-report-v1",
+) -> Mapping[str, Any]:
+    labels = tuple(label for split in split_names for label in split_rows[split]["labels"])
+    features = tuple(feature for split in split_names for feature in split_rows[split]["features"])
+    source_counts = Counter(str(label.get("dataset_source")) for label in labels)
+    preserved_counts = Counter(str(label.get("is_utility_preserved")) for label in labels)
+    failure_counts = Counter(str(label.get("failure_type") or "none") for label in labels)
+    strategy_counts = Counter(str(label.get("candidate_strategy") or "unknown") for label in labels)
+    strategy_false_counts = Counter(
+        str(label.get("candidate_strategy") or "unknown")
+        for label in labels
+        if label.get("is_utility_preserved") is False
+    )
+    trainable_count = sum(1 for label in labels if label.get("is_utility_preserved") in {True, False})
+    scan_report = _scan_prompt_safe_outputs(
+        output_root,
+        split_names=split_names,
+        report_names=scan_report_names,
+    )
+    return {
+        "schema_version": schema_version,
+        "created_at": created_at,
+        "label_count": len(labels),
+        "feature_count": len(features),
+        "trainable_label_count": trainable_count,
+        "feature_count_matches_trainable_labels": len(features) == trainable_count,
+        "source_counts": dict(sorted(source_counts.items())),
+        "is_utility_preserved_counts": dict(sorted(preserved_counts.items())),
+        "failure_type_counts": dict(sorted(failure_counts.items())),
+        "candidate_strategy_counts": dict(sorted(strategy_counts.items())),
+        "candidate_strategy_false_counts": dict(sorted(strategy_false_counts.items())),
+        "label_source_counts": dict(sorted(Counter(str(label.get("label_source")) for label in labels).items())),
+        "prompt_text_saved": _has_prompt_text(labels) or _has_prompt_text(features),
+        "scan_report": scan_report,
+        "checkpoint_count": len(checkpoint_reports),
+        "checkpoint_passed_count": sum(1 for report in checkpoint_reports if report.get("passed") is True),
+        "anomalous_batch_count": len(anomalous_batches),
+        "anomalous_batches": tuple(anomalous_batches),
+        "original_failed_skipped_not_in_features": _original_failed_skipped_not_in_features(labels, features),
+        "all_sources_present": all(source in source_counts for source in DATASET_SOURCES),
+        "ready_for_baseline_training": (
+            bool(labels)
+            and len(features) == trainable_count
+            and not anomalous_batches
+            and all(label.get("label_source") == "dsapi_execution_oracle" for label in labels)
+            and not scan_report["has_hits"]
+        ),
+    }
+
+
+def _full_build_summary(
+    *,
+    source: str,
+    max_tasks: int,
+    batch_size: int,
+    checkpoint_api_calls: int,
+    max_api_calls: int,
+    include_text: bool,
+    created_at: str,
+    elapsed_seconds: float,
+    split_rows: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+    cost_summary: Mapping[str, Any],
+    quality_report: Mapping[str, Any],
+    checkpoint_reports: Sequence[Mapping[str, Any]],
+    anomalous_batches: Sequence[Mapping[str, Any]],
+    output_paths: Mapping[str, Any],
+    source_reports: Mapping[str, Any],
+    total_cost_at_last_checkpoint: float,
+    split_names: Sequence[str] = FINAL_SPLITS,
+    mode: str = "train_real",
+    schema_version: str = "utility-validator-full-build-summary-v1",
+    extra_fields: Mapping[str, Any] | None = None,
+    exception_policy: str = "anomalous batches are written under reports/full_checkpoints and not merged",
+) -> Mapping[str, Any]:
+    split_counts = {
+        split: {
+            "task_count": len(split_rows[split]["tasks"]),
+            "label_count": len(split_rows[split]["labels"]),
+            "feature_count": len(split_rows[split]["features"]),
+        }
+        for split in split_names
+    }
+    labels = tuple(label for split in split_names for label in split_rows[split]["labels"])
+    features = tuple(feature for split in split_names for feature in split_rows[split]["features"])
+    summary = {
+        "schema_version": schema_version,
+        "created_at": created_at,
+        "source": source,
+        "mode": mode,
+        "backend": "dsapi",
+        "api_model": cost_summary.get("model"),
+        "api_model_is_v4_flash": cost_summary.get("model_is_v4_flash"),
+        "api_model_is_pro": cost_summary.get("model_is_pro"),
+        "max_tasks": max_tasks,
+        "batch_size": batch_size,
+        "checkpoint_api_calls": checkpoint_api_calls,
+        "max_api_calls": max_api_calls,
+        "split_counts": split_counts,
+        "label_count": len(labels),
+        "feature_count": len(features),
+        "source_counts": quality_report.get("source_counts"),
+        "is_utility_preserved_counts": quality_report.get("is_utility_preserved_counts"),
+        "failure_type_counts": quality_report.get("failure_type_counts"),
+        "cost_summary": cost_summary,
+        "quality_report_path": str(output_paths["reports"]["quality_report"]),
+        "cost_summary_path": str(output_paths["reports"]["cost_summary"]),
+        "dataset_card_path": str(output_paths["reports"]["dataset_card"]),
+        "training_usage_path": str(output_paths["reports"]["training_usage"]),
+        "outputs": _stringify_output_paths(output_paths),
+        "prompt_text_saved": quality_report.get("prompt_text_saved"),
+        "scan_report": quality_report.get("scan_report"),
+        "checkpoint_count": len(checkpoint_reports),
+        "checkpoint_reports": tuple(checkpoint_reports),
+        "anomalous_batch_count": len(anomalous_batches),
+        "anomalous_batches": tuple(anomalous_batches),
+        "exception_policy": exception_policy,
+        "source_reports": source_reports,
+        "include_text": include_text,
+        "ready_for_baseline_training": quality_report.get("ready_for_baseline_training"),
+        "elapsed_seconds": elapsed_seconds,
+        "total_cost_at_last_checkpoint": total_cost_at_last_checkpoint,
+        "pytest_report": None,
+    }
+    if extra_fields:
+        summary.update(dict(extra_fields))
+    return summary
+
+
 def build_readiness_report(
     *,
     output_root: str | Path,
@@ -1383,6 +2975,42 @@ def update_readiness_report_with_pytest(
     return report
 
 
+def update_full_build_summary_with_pytest(
+    *,
+    output_root: str | Path,
+    pytest_q_passed: bool,
+    pytest_report: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    output = Path(output_root)
+    summary_path = output / "reports" / "full_build_summary.json"
+    summary = dict(_read_json_safe(summary_path))
+    summary["pytest_report"] = {
+        "pytest_q_passed": pytest_q_passed,
+        **dict(pytest_report or {}),
+    }
+    summary["ready_for_baseline_training"] = bool(summary.get("ready_for_baseline_training")) and pytest_q_passed
+    _write_json(summary_path, summary)
+    return summary
+
+
+def update_expanded_build_summary_with_pytest(
+    *,
+    output_root: str | Path,
+    pytest_q_passed: bool,
+    pytest_report: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    output = Path(output_root)
+    summary_path = output / "reports" / "expanded_build_summary.json"
+    summary = dict(_read_json_safe(summary_path))
+    summary["pytest_report"] = {
+        "pytest_q_passed": pytest_q_passed,
+        **dict(pytest_report or {}),
+    }
+    summary["ready_for_baseline_training"] = bool(summary.get("ready_for_baseline_training")) and pytest_q_passed
+    _write_json(summary_path, summary)
+    return summary
+
+
 def _strip_private_task_fields(task: Mapping[str, Any]) -> Mapping[str, Any]:
     return {key: value for key, value in task.items() if not key.startswith("_local_")}
 
@@ -1409,6 +3037,11 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
 def _read_jsonl_safe(path: Path) -> tuple[dict[str, Any], ...]:
     if not path.exists():
         return ()
@@ -1428,6 +3061,189 @@ def _read_json_safe(path: Path) -> Mapping[str, Any]:
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
     return value if isinstance(value, Mapping) else {}
+
+
+def _scan_prompt_safe_outputs(
+    output_root: Path,
+    *,
+    split_names: Sequence[str] = FINAL_SPLITS,
+    report_names: Mapping[str, str] | None = None,
+) -> Mapping[str, Any]:
+    scan_paths = tuple(output_root / "labels" / split for split in split_names) + tuple(
+        output_root / "features" / split for split in split_names
+    ) + (
+        output_root / "reports" / ("expanded_checkpoints" if any(str(split).startswith("expanded_") for split in split_names) else "full_checkpoints"),
+    )
+    report_file_names = {
+        "full_build_summary": "full_build_summary.json",
+        "cost_summary": "cost_summary.json",
+        "quality_report": "quality_report.json",
+        "dataset_card": "dataset_card.md",
+        "training_usage": "training_usage.md",
+    }
+    if report_names is not None:
+        report_file_names.update(dict(report_names))
+    report_files = (
+        output_root / "reports" / report_file_names["full_build_summary"],
+        output_root / "reports" / report_file_names["cost_summary"],
+        output_root / "reports" / report_file_names["quality_report"],
+        output_root / "reports" / report_file_names["dataset_card"],
+        output_root / "reports" / report_file_names["training_usage"],
+    )
+    literal_patterns = (
+        "def has_close_elements",
+        "SMOKE-PRIVATE-TOKEN-7",
+        "ALPHA-PRIVATE",
+        "Internal account token",
+        "Auditor note",
+        "PROMPT_UNDER_TEST",
+        "ORACLE_OUTPUT_CONTRACT",
+    )
+    secret_patterns = (re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{15,}\b"),)
+    hits: list[dict[str, Any]] = []
+    for root in scan_paths:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".json", ".jsonl", ".md", ".txt"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for pattern in literal_patterns:
+                if pattern in text:
+                    hits.append({"path": str(path), "pattern": pattern})
+            for pattern in secret_patterns:
+                if pattern.search(text):
+                    hits.append({"path": str(path), "pattern": pattern.pattern})
+    for path in report_files:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for pattern in literal_patterns:
+            if pattern in text:
+                hits.append({"path": str(path), "pattern": pattern})
+        for pattern in secret_patterns:
+            if pattern.search(text):
+                hits.append({"path": str(path), "pattern": pattern.pattern})
+    return {
+        "has_hits": bool(hits),
+        "hit_count": len(hits),
+        "hits": tuple(hits[:20]),
+        "scanned_paths": tuple(str(path) for path in scan_paths + report_files),
+    }
+
+
+def _jsonl_readability_report(output_root: Path) -> Mapping[str, Any]:
+    paths = tuple(
+        path
+        for base in (
+            output_root / "labels",
+            output_root / "features",
+            output_root / "tasks",
+        )
+        if base.exists()
+        for path in base.rglob("*.jsonl")
+    )
+    errors: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            _read_jsonl_safe(path)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"path": str(path), "error": str(exc)})
+    return {"readable": not errors, "checked_file_count": len(paths), "errors": tuple(errors[:20])}
+
+
+def _stringify_output_paths(paths: Mapping[str, Any]) -> Mapping[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in paths.items():
+        if isinstance(value, Mapping):
+            result[key] = {inner_key: str(inner_value) for inner_key, inner_value in value.items()}
+        else:
+            result[key] = str(value)
+    return result
+
+
+def _dataset_card_markdown(summary: Mapping[str, Any]) -> str:
+    split_counts = summary.get("split_counts") if isinstance(summary.get("split_counts"), Mapping) else {}
+    return "\n".join(
+        [
+            "# Utility Validator Full Real Dataset",
+            "",
+            f"Created: {summary.get('created_at')}",
+            f"Model: {summary.get('api_model')}",
+            "Label source: dsapi_execution_oracle",
+            "",
+            "## Splits",
+            "",
+            json.dumps(split_counts, ensure_ascii=False, indent=2, sort_keys=True),
+            "",
+            "## Sources",
+            "",
+            json.dumps(summary.get("source_counts") or {}, ensure_ascii=False, indent=2, sort_keys=True),
+            "",
+            "## Labels",
+            "",
+            "The target label is `is_utility_preserved`. Use only rows where this field is true or false for supervised training.",
+            "",
+            "## Safety",
+            "",
+            f"Prompt text saved: {summary.get('prompt_text_saved')}",
+            "API keys are not stored in dataset artifacts.",
+        ]
+    )
+
+
+def _training_usage_markdown(summary: Mapping[str, Any]) -> str:
+    outputs = summary.get("outputs") if isinstance(summary.get("outputs"), Mapping) else {}
+    return "\n".join(
+        [
+            "# Training Usage",
+            "",
+            "## Dataset Location",
+            "",
+            f"Labels: `{outputs.get('labels')}`",
+            f"Features: `{outputs.get('features')}`",
+            "",
+            "## Files",
+            "",
+            "- `features/train/train_features.jsonl`, `features/valid/valid_features.jsonl`, `features/test/test_features.jsonl`: direct training feature aliases.",
+            "- `features/*/training_features.jsonl`: same feature rows under the existing dataset layout.",
+            "- `labels/*/utility_labels.jsonl`: oracle labels and run metadata.",
+            "",
+            "## Feature Fields",
+            "",
+            "Use structured fields such as `dataset_source`, `scenario_type`, `candidate_strategy`, `source_scopes`, `target_scopes`, `risk_tags`, `dependency_notes`, `moved_block_count`, `movement_distance_summary`, `estimated_cache_gain`, `cached_tokens_delta`, and `hard_warning_count` as model inputs.",
+            "",
+            "## Training Label",
+            "",
+            "`is_utility_preserved` is the supervised target. `true` means reordered prompt preserved utility; `false` means original passed but reordered failed.",
+            "",
+            "## Filtering",
+            "",
+            "Filter out rows where `is_utility_preserved` is null. These are skipped samples, usually because the original prompt failed and should not enter supervised training.",
+            "",
+            "## Fake Data Guard",
+            "",
+            "Use only labels with `label_source == dsapi_execution_oracle`; never mix `fake_smoke_oracle` rows into train/valid/test.",
+            "",
+            "## Reading Splits",
+            "",
+            "Read JSONL line by line, parse each line as JSON, then join feature rows to labels by `label_id` if label metadata is needed.",
+            "",
+            "## Baseline Training",
+            "",
+            "For a first Utility Validator baseline, train a binary classifier on non-skipped feature rows with `is_utility_preserved` as the target. Keep valid/test untouched for model selection and final evaluation.",
+            "",
+            "## Limitations",
+            "",
+            "This dataset is produced from a compact source set with deterministic prompt variants. It validates the real DS API labeling chain, but broader source diversity may be needed before strong generalization claims.",
+        ]
+    )
 
 
 def _has_prompt_text(rows: Sequence[Mapping[str, Any]]) -> bool:
@@ -1456,6 +3272,19 @@ def _original_failed_skipped_not_in_features(
             if str(label.get("label_id")) in feature_label_ids:
                 return False
     return True
+
+
+def _schema_parse_error_count(labels: Sequence[Mapping[str, Any]]) -> int:
+    count = 0
+    parse_markers = ("output_is_not_valid_json", "parse", "invalid_json", "json_decode")
+    for label in labels:
+        if label.get("failure_type") != "json_schema_fail":
+            continue
+        reordered = (label.get("oracle_reports") or {}).get("reordered") if isinstance(label.get("oracle_reports"), Mapping) else {}
+        reason = str((reordered or {}).get("reason") or label.get("utility_status") or "").lower()
+        if any(marker in reason for marker in parse_markers):
+            count += 1
+    return count
 
 
 def _recommended_full_labeling_command(*, model: str) -> str:
